@@ -31,7 +31,7 @@ from tqdm import tqdm
 что сервис токенизации доступен.
 """
 
-from typing import NamedTuple, List, Any
+from typing import NamedTuple, List, Any, Optional
 import numpy as np
 import onnxruntime as ort
 import requests
@@ -212,7 +212,7 @@ class SVR_TTS:
         Возвращает:
             Список numpy-массивов, каждый из которых представляет сгенерированное аудио.
         """
-        synthesized_audios: List[np.ndarray] = []
+        synthesized_audios: List[Optional[np.ndarray]] = []
         token_list = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_resp = self._tokenize(token_list)
         if not tokenize_resp['tokens'] and tokenize_resp['desc']:
@@ -220,6 +220,9 @@ class SVR_TTS:
             return []
         # Обработка каждого элемента входных данных
         for idx, current_input in enumerate(tqdm(inputs, desc=tokenize_resp['desc'])):
+            if not tokenize_resp['tokens'][idx]:
+                synthesized_audios.append(None)
+                continue
             timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
             prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
 
