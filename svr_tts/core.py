@@ -215,7 +215,7 @@ class SVR_TTS:
         synthesized_audios: List[Optional[np.ndarray]] = []
         token_list = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_resp = self._tokenize(token_list)
-        if not tokenize_resp['tokens'] and tokenize_resp['desc']:
+        if (not tokenize_resp['tokens'] or all(x is None for x in tokenize_resp['tokens'])) and tokenize_resp['desc']:
             logger.error(tokenize_resp['desc'])
             return []
         # Обработка каждого элемента входных данных
