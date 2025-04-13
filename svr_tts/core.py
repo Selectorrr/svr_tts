@@ -96,7 +96,7 @@ class SVR_TTS:
         "vocoder": "svr_vocoder.onnx",
     }
 
-    def __init__(self, api_key, tokenizer_service_url: str = "http://188.243.175.64/tokenize_batch",
+    def __init__(self, api_key, tokenizer_service_url: str = "http://synthvoice.ru/tokenize_batch",
                  providers: List[str] = None) -> None:
         """
         Инициализация объектов инференс-сессий для всех моделей.
@@ -219,7 +219,7 @@ class SVR_TTS:
             logger.error(tokenize_resp['desc'])
             return []
         # Обработка каждого элемента входных данных
-        for idx, current_input in enumerate(tqdm(inputs, desc=tokenize_resp['desc'])):
+        for idx, current_input in enumerate(tqdm(inputs, desc=tokenize_resp['desc'], leave=False)):
             if not tokenize_resp['tokens'][idx]:
                 synthesized_audios.append(None)
                 continue
