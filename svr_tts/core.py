@@ -13,9 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import logging
 import os
 
 from huggingface_hub import hf_hub_download
+from tqdm import tqdm
 
 """
 Модуль синтеза речи с использованием нескольких моделей ONNX.
@@ -37,6 +39,8 @@ from appdirs import user_cache_dir
 
 # Длина перекрытия для кроссфейда между аудио сегментами
 OVERLAP_LENGTH = 4096
+
+logger = logging.getLogger(__name__)
 
 
 class SynthesisInput(NamedTuple):
@@ -92,7 +96,7 @@ class SVR_TTS:
         "vocoder": "svr_vocoder.onnx",
     }
 
-    def __init__(self, tokenizer_service_url: str = "http://192.168.1.121:8000/tokenize_batch",
+    def __init__(self, api_key, tokenizer_service_url: str = "http://188.243.175.64/tokenize_batch",
                  providers: List[str] = None) -> None:
         """
         Инициализация объектов инференс-сессий для всех моделей.
@@ -111,6 +115,7 @@ class SVR_TTS:
         self.encoder_model = ort.InferenceSession(self._download("encoder", cache_dir), providers=providers)
         self.estimator_model = ort.InferenceSession(self._download("estimator", cache_dir), providers=providers)
         self.vocoder_model = ort.InferenceSession(self._download("vocoder", cache_dir), providers=providers)
+        self.api_key = api_key
 
     def _get_cache_dir(self) -> str:
         cache_dir = user_cache_dir("svr_tts", "SynthVoiceRu")
@@ -120,7 +125,7 @@ class SVR_TTS:
     def _download(self, key: str, cache_dir: str) -> str:
         return hf_hub_download(repo_id=self.REPO_ID, filename=self.MODEL_FILES[key], cache_dir=cache_dir)
 
-    def _tokenize(self, token_inputs: List[dict]) -> np.ndarray:
+    def _tokenize(self, token_inputs: List[dict]) -> dict:
         """
         Отправляет данные для токенизации к REST-сервису и возвращает результат.
 
@@ -133,9 +138,14 @@ class SVR_TTS:
         Генерирует:
             AssertionError, если HTTP статус запроса не 200.
         """
-        response = requests.post(self.tokenizer_service_url, json=token_inputs)
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.api_key
+        }
+
+        response = requests.post(self.tokenizer_service_url, json=token_inputs, headers=headers)
         assert response.status_code == 200, f"Ошибка {response.status_code}: {response.text}"
-        return np.array(response.json())
+        return response.json()
 
     def _synthesize_segment(self, cat_conditions: np.ndarray, latent_features: np.ndarray,
                             time_span: List[float], data_length: int, prompt_features: np.ndarray,
@@ -204,10 +214,11 @@ class SVR_TTS:
         """
         synthesized_audios: List[np.ndarray] = []
         token_list = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
-        tokens = self._tokenize(token_list)
-
+        tokenize_resp = self._tokenize(token_list)
+        if not tokenize_resp['tokens'] and tokenize_resp['desc']:
+            logger.error(tokenize_resp['desc'])
         # Обработка каждого элемента входных данных
-        for idx, current_input in enumerate(inputs):
+        for idx, current_input in enumerate(tqdm(inputs, desc=tokenize_resp['desc'])):
             timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
             prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
 
@@ -219,7 +230,7 @@ class SVR_TTS:
             wave_24k, wave_feat, wave_feat_len, timbre_feat, timbre_feat_len, _ = \
                 self.base_model.run(
                     ["wave_24k", "wave_feat", "wave_feat_len", "timbre_feat", "timbre_feat_len", "duration"], {
-                        "input_ids": np.expand_dims(tokens[idx], 0),
+                        "input_ids": np.expand_dims(tokenize_resp['tokens'][idx], 0),
                         "timbre_wave_24k": timbre_wave,
                         "prosody_wave_24k": prosody_wave,
                         "duration_or_speed": np.array([duration_or_speed], dtype=np.float32),
