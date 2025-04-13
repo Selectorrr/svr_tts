@@ -217,6 +217,7 @@ class SVR_TTS:
         tokenize_resp = self._tokenize(token_list)
         if not tokenize_resp['tokens'] and tokenize_resp['desc']:
             logger.error(tokenize_resp['desc'])
+            return []
         # Обработка каждого элемента входных данных
         for idx, current_input in enumerate(tqdm(inputs, desc=tokenize_resp['desc'])):
             timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
