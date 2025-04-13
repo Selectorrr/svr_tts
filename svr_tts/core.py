@@ -144,7 +144,12 @@ class SVR_TTS:
         }
 
         response = requests.post(self.tokenizer_service_url, json=token_inputs, headers=headers)
-        assert response.status_code == 200, f"{response.json()['text']}"
+        if response.status_code != 200:
+            try:
+                text = response.json()['text']
+            except Exception:
+                text = f"Ошибка {response.status_code}: {response.text}"
+            raise AssertionError(text)
         return response.json()
 
     def _synthesize_segment(self, cat_conditions: np.ndarray, latent_features: np.ndarray,
