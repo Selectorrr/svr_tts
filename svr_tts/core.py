@@ -96,7 +96,7 @@ class SVR_TTS:
         "vocoder": "svr_vocoder.onnx",
     }
 
-    def __init__(self, api_key, tokenizer_service_url: str = "http://synthvoice.ru/tokenize_batch",
+    def __init__(self, api_key, tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
                  providers: List[str] = None) -> None:
         """
         Инициализация объектов инференс-сессий для всех моделей.
