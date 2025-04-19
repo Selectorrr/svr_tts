@@ -212,7 +212,8 @@ class SVR_TTS:
                          duration_or_speed: float = None,
                          is_speed: bool = False,
                          scaling_min: float = 0.875,
-                         scaling_max: float = 1.3) -> List[np.ndarray]:
+                         scaling_max: float = 1.3, tqdm_leave=False, tqdm_position=0, tqdm_smoothing=0.3,
+                         tqdm_disable=False) -> List[np.ndarray]:
         """
         Синтезирует аудио для каждого элемента входного списка.
 
@@ -230,7 +231,9 @@ class SVR_TTS:
         token_list = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_resp = self._tokenize(token_list)
         # Обработка каждого элемента входных данных
-        for idx, current_input in enumerate(tqdm(inputs, desc=tokenize_resp['desc'], leave=False)):
+        for idx, current_input in enumerate(
+                tqdm(inputs, desc=tokenize_resp['desc'], leave=tqdm_leave, position=tqdm_position,
+                     smoothing=tqdm_smoothing, disable=tqdm_disable)):
             if not tokenize_resp['tokens'][idx]:
                 synthesized_audios.append(None)
                 continue
