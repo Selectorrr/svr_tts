@@ -32,7 +32,7 @@ from tqdm import tqdm
 что сервис токенизации доступен.
 """
 
-from typing import NamedTuple, List, Any, Optional, Sequence
+from typing import NamedTuple, List, Any, Optional, Sequence, Dict
 import numpy as np
 import onnxruntime as ort
 import requests
@@ -212,8 +212,7 @@ class SVR_TTS:
                          duration_or_speed: float = None,
                          is_speed: bool = False,
                          scaling_min: float = 0.875,
-                         scaling_max: float = 1.3, tqdm_leave=False, tqdm_position=0, tqdm_smoothing=0.3,
-                         tqdm_disable=False) -> List[np.ndarray]:
+                         scaling_max: float = 1.3, tqdm_kwargs: Dict[str, Any] = None) -> List[np.ndarray]:
         """
         Синтезирует аудио для каждого элемента входного списка.
 
@@ -231,9 +230,9 @@ class SVR_TTS:
         token_list = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_resp = self._tokenize(token_list)
         # Обработка каждого элемента входных данных
+        tqdm_kwargs = tqdm_kwargs or {}
         for idx, current_input in enumerate(
-                tqdm(inputs, desc=tokenize_resp['desc'], leave=tqdm_leave, position=tqdm_position,
-                     smoothing=tqdm_smoothing, disable=tqdm_disable)):
+                tqdm(inputs, desc=tokenize_resp['desc'], **tqdm_kwargs)):
             if not tokenize_resp['tokens'][idx]:
                 synthesized_audios.append(None)
                 continue
@@ -277,7 +276,7 @@ class SVR_TTS:
                     }))
 
             generated_chunks: List[np.ndarray] = []
-            prev_overlap_chunk: np.ndarray = None
+            prev_overlap_chunk: np.ndarray | None = None
 
             # Обработка каждого сегмента аудио
             for seg_idx, seg_length in enumerate(data_lengths):
