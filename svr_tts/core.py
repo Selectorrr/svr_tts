@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import base64
+import hashlib
 import logging
 import os
+import pickle
+import tempfile
+from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
@@ -99,7 +103,8 @@ class SVR_TTS:
 
     def __init__(self, api_key, tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
                  providers: Sequence[str | tuple[str, dict[Any, Any]]] | None = None,
-                 provider_options: Sequence[dict[Any, Any]] | None = None) -> None:
+                 provider_options: Sequence[dict[Any, Any]] | None = None,
+                 timbre_cache_dir='workspace/voices/') -> None:
         """
         Инициализация объектов инференс-сессий для всех моделей.
 
@@ -125,6 +130,8 @@ class SVR_TTS:
         if api_key:
             api_key = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
         self.api_key = api_key
+        self._timbre_cache_dir = Path(os.path.join(timbre_cache_dir, "timbre_cache"))
+        self._timbre_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_cache_dir(self) -> str:
         cache_dir = user_cache_dir("svr_tts", "SynthVoiceRu")
@@ -208,6 +215,23 @@ class SVR_TTS:
         })[0]
         return wave_22050[0]
 
+    def _cacheable_timbre(self, speaker_style, timbre_wave):
+        # создаём ключ из содержимого wav (bytes view быстрее, чем tobytes())
+        key = hashlib.sha256(timbre_wave.view('uint8')).hexdigest()
+        cache_file = self._timbre_cache_dir / f"{key}.pkl"
+
+        # пытаемся загрузить кэш, ловим только отсутствие файла или кривой pkl
+        try:
+            return pickle.loads(cache_file.read_bytes())
+        except (FileNotFoundError, pickle.UnpicklingError):
+            # атомарно записываем новый кэш во временный файл, потом переименовываем
+            data = pickle.dumps(speaker_style, protocol=pickle.HIGHEST_PROTOCOL)
+            with tempfile.NamedTemporaryFile(dir=self._timbre_cache_dir, delete=False) as tmp:
+                tmp.write(data)
+                tmp.flush()
+            Path(tmp.name).replace(cache_file)
+            return speaker_style
+
     def synthesize_batch(self, inputs: List[SynthesisInput],
                          duration_or_speed: float = None,
                          is_speed: bool = False,
@@ -277,6 +301,8 @@ class SVR_TTS:
 
             generated_chunks: List[np.ndarray] = []
             prev_overlap_chunk: np.ndarray | None = None
+
+            speaker_style = self._cacheable_timbre(speaker_style, timbre_wave)
 
             # Обработка каждого сегмента аудио
             for seg_idx, seg_length in enumerate(data_lengths):
