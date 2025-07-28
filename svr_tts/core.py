@@ -92,9 +92,9 @@ class SVR_TTS:
         synthesize_batch: синтезирует аудио для каждого элемента входных данных.
     """
 
-    REPO_ID = "selectorrrr/svr-tts-large-v1"
+    REPO_ID = "selectorrrr/svr-tts-large"
     MODEL_FILES = {
-        "base": "svr_base.onnx",
+        "base": "svr_base_v2.onnx",
         "semantic": "svr_semantic.onnx",
         "encoder": "svr_encoder.onnx",
         "estimator": "svr_estimator.onnx",
