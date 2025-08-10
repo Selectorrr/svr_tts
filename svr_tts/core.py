@@ -94,7 +94,7 @@ class SVR_TTS:
 
     REPO_ID = "selectorrrr/svr-tts-large"
     MODEL_FILES = {
-        "base": "svr_base_v2.onnx",
+        "base": "svr_base_v1.onnx",
         "semantic": "svr_semantic.onnx",
         "encoder": "svr_encoder.onnx",
         "estimator": "svr_estimator.onnx",
