@@ -18,14 +18,15 @@ from setuptools import setup, find_packages
 
 setup(
     name='svr_tts',
-    version='0.7',
+    version='0.8',
     packages=find_packages(),
     install_requires=[
         'onnxruntime-gpu',
         'numpy',
         'huggingface_hub',
         'appdirs',
-        'tqdm'
+        'tqdm',
+        'requests',
     ],
     author='Selector',
     description='Синтез речи'

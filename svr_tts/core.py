@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import base64
-import hashlib
 import logging
 import os
-import pickle
-import tempfile
+import traceback
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
+
+from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade
 
 """
 Модуль синтеза речи с использованием нескольких моделей ONNX.
@@ -38,12 +38,17 @@ from tqdm import tqdm
 
 from typing import NamedTuple, List, Any, Optional, Sequence, Dict
 import numpy as np
+# noinspection PyPackageRequirements
 import onnxruntime as ort
 import requests
 from appdirs import user_cache_dir
 
 # Длина перекрытия для кроссфейда между аудио сегментами
 OVERLAP_LENGTH = 4096
+EPS = 1e-8
+INPUT_SR = 24_000
+OUTPUT_SR = 22_050
+FADE_LEN = int(0.1 * OUTPUT_SR)
 
 logger = logging.getLogger(__name__)
 
@@ -64,22 +69,6 @@ class SynthesisInput(NamedTuple):
     prosody_wave_24k: np.ndarray
 
 
-def _crossfade(prev_chunk: np.ndarray, next_chunk: np.ndarray, overlap: int) -> np.ndarray:
-    """
-    Применяет кроссфейд (плавное смешивание) к двум аудио сегментам.
-
-    Аргументы:
-        prev_chunk: предыдущий аудио сегмент (numpy-массив).
-        next_chunk: следующий аудио сегмент (numpy-массив).
-        overlap: число точек перекрытия для кроссфейда.
-
-    Возвращает:
-        Обновленный next_chunk, где его начало плавно заменено данными из конца prev_chunk.
-    """
-    fade_out = np.cos(np.linspace(0, np.pi / 2, overlap)) ** 2
-    fade_in = np.cos(np.linspace(np.pi / 2, 0, overlap)) ** 2
-    next_chunk[:overlap] = next_chunk[:overlap] * fade_in + prev_chunk[-overlap:] * fade_out
-    return next_chunk
 
 
 class SVR_TTS:
@@ -94,11 +83,13 @@ class SVR_TTS:
 
     REPO_ID = "selectorrrr/svr-tts-large"
     MODEL_FILES = {
-        "base": "svr_base_v1.onnx",
+        "base": "svr_base_v3.onnx",
         "semantic": "svr_semantic.onnx",
-        "encoder": "svr_encoder.onnx",
+        "encoder": "svr_encoder_v1.onnx",
+        "style": "svr_style.onnx",
         "estimator": "svr_estimator.onnx",
         "vocoder": "svr_vocoder.onnx",
+        "cfe": "svr_cfe.onnx",
     }
 
     def __init__(self, api_key, tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
@@ -119,10 +110,14 @@ class SVR_TTS:
         os.environ["TQDM_POSITION"] = "-1"
         self.base_model = ort.InferenceSession(self._download("base", cache_dir), providers=providers,
                                                provider_options=provider_options)
+        self.cfe_model = ort.InferenceSession(self._download("cfe", cache_dir), providers=providers,
+                                               provider_options=provider_options)
         self.semantic_model = ort.InferenceSession(self._download("semantic", cache_dir), providers=providers,
                                                    provider_options=provider_options)
         self.encoder_model = ort.InferenceSession(self._download("encoder", cache_dir), providers=providers,
                                                   provider_options=provider_options)
+        self.style_model = ort.InferenceSession(self._download("style", cache_dir), providers=providers,
+                                                provider_options=provider_options)
         self.estimator_model = ort.InferenceSession(self._download("estimator", cache_dir), providers=providers,
                                                     provider_options=provider_options)
         self.vocoder_model = ort.InferenceSession(self._download("vocoder", cache_dir), providers=providers,
@@ -215,23 +210,6 @@ class SVR_TTS:
         })[0]
         return wave_22050[0]
 
-    def _cacheable_timbre(self, speaker_style, timbre_wave):
-        # создаём ключ из содержимого wav (bytes view быстрее, чем tobytes())
-        key = hashlib.sha256(timbre_wave.view('uint8')).hexdigest()
-        cache_file = self._timbre_cache_dir / f"{key}.pkl"
-
-        # пытаемся загрузить кэш, ловим только отсутствие файла или кривой pkl
-        try:
-            return pickle.loads(cache_file.read_bytes())
-        except (FileNotFoundError, pickle.UnpicklingError):
-            # атомарно записываем новый кэш во временный файл, потом переименовываем
-            data = pickle.dumps(speaker_style, protocol=pickle.HIGHEST_PROTOCOL)
-            with tempfile.NamedTemporaryFile(dir=self._timbre_cache_dir, delete=False) as tmp:
-                tmp.write(data)
-                tmp.flush()
-            Path(tmp.name).replace(cache_file)
-            return speaker_style
-
     def synthesize_batch(self, inputs: List[SynthesisInput],
                          duration_or_speed: float = None,
                          is_speed: bool = False,
@@ -268,11 +246,10 @@ class SVR_TTS:
                 duration_or_speed = len(prosody_wave) / 24000
 
             # Получение базовых признаков через базовую модель
-            wave_24k, wave_feat, wave_feat_len, timbre_feat, timbre_feat_len, _ = \
+            wave_24k, _ = \
                 self.base_model.run(
-                    ["wave_24k", "wave_feat", "wave_feat_len", "timbre_feat", "timbre_feat_len", "duration"], {
+                    ["wave_24k", "duration"], {
                         "input_ids": np.expand_dims(tokenize_resp['tokens'][idx], 0),
-                        "timbre_wave_24k": timbre_wave,
                         "prosody_wave_24k": prosody_wave,
                         "duration_or_speed": np.array([duration_or_speed], dtype=np.float32),
                         "is_speed": np.array([is_speed], dtype=bool),
@@ -280,29 +257,23 @@ class SVR_TTS:
                         "scaling_max": np.array([scaling_max], dtype=np.float32)
                     })
 
-            # Получение семантических признаков для аудио и тембра
-            semantic_wave = self.semantic_model.run(None, {
-                'input_features': wave_feat.astype(np.float32)
-            })[0][:, :wave_feat_len]
-            semantic_timbre = self.semantic_model.run(None, {
-                'input_features': timbre_feat.astype(np.float32)
-            })[0][:, :timbre_feat_len]
+            min_len = min(len(timbre_wave), len(prosody_wave))
+            timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
+            speaker_style = self.compute_style(timbre_wave)
 
             # Получаем условия для дальнейшего кодирования и генерации
-            cat_conditions, latent_features, time_span, data_lengths, prompt_features, speaker_style, prompt_length = (
+            cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
                 self.encoder_model.run(
                     ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
-                     "speaker_style", "prompt_length"], {
+                     "prompt_length"], {
                         "wave_24k": wave_24k,
-                        "prosody_wave": prosody_wave,
-                        "semantic_wave": semantic_wave,
-                        "semantic_timbre": semantic_timbre
+                        "semantic_wave": self.compute_semantic(wave_24k),
+                        "prosody_wave": timbre_wave,
+                        "semantic_timbre": self.compute_semantic(timbre_wave)
                     }))
 
             generated_chunks: List[np.ndarray] = []
-            prev_overlap_chunk: np.ndarray | None = None
-
-            speaker_style = self._cacheable_timbre(speaker_style, timbre_wave)
+            prev_overlap_chunk: Optional[np.ndarray] = None
 
             # Обработка каждого сегмента аудио
             for seg_idx, seg_length in enumerate(data_lengths):
@@ -315,6 +286,7 @@ class SVR_TTS:
                                                         prompt_length)
                 # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
                 if seg_idx == 0:
+                    mute_fade(segment_wave, OUTPUT_SR)
                     chunk = segment_wave[:-OVERLAP_LENGTH]
                     generated_chunks.append(chunk)
                     prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
@@ -332,3 +304,58 @@ class SVR_TTS:
             # Объединяем все сегменты в одно аудио
             synthesized_audios.append(np.concatenate(generated_chunks))
         return synthesized_audios
+
+    def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None):
+        split_inputs = []
+        mapping = []
+
+        for idx, inp in enumerate(inputs):
+            chunks = split_text(inp.text, max_text_len)
+            chunks = split_audio(inp.prosody_wave_24k, chunks)
+
+            for chunk_text, chunk_prosody in chunks:
+                split_inputs.append(SynthesisInput(
+                    text=chunk_text,
+                    stress=inp.stress,
+                    timbre_wave_24k=inp.timbre_wave_24k,
+                    prosody_wave_24k=prepare_prosody(chunk_prosody, INPUT_SR)
+                ))
+            mapping.append((idx, len(chunks)))
+
+        try:
+            all_waves = self.synthesize_batch(split_inputs, tqdm_kwargs=tqdm_kwargs)
+        except Exception as e:
+            traceback.print_exc()
+            all_waves = [None] * len(split_inputs)
+
+        merged = []
+        wave_idx = 0
+        OVERLAP_LEN = FADE_LEN
+
+        for _, count in mapping:
+            generated_chunks = []
+            prev_overlap_chunk = None
+            ok = True
+
+            for seg_idx in range(count):
+                wave_22050 = all_waves[wave_idx]
+                wave_idx += 1
+
+                if wave_22050 is None:
+                    ok = False
+                    break
+
+                if seg_idx == 0:
+                    generated_chunks.append(wave_22050[:-OVERLAP_LEN])
+                    prev_overlap_chunk = wave_22050[-OVERLAP_LEN:]
+                elif seg_idx == count - 1:
+                    chunk = _crossfade(prev_overlap_chunk, wave_22050, OVERLAP_LEN)
+                    generated_chunks.append(chunk)
+                else:
+                    chunk = _crossfade(prev_overlap_chunk, wave_22050[:-OVERLAP_LEN], OVERLAP_LEN)
+                    generated_chunks.append(chunk)
+                    prev_overlap_chunk = wave_22050[-OVERLAP_LEN:]
+
+            merged.append(np.concatenate(generated_chunks) if ok else None)
+
+        return merged

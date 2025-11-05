@@ -14,7 +14,7 @@ if __name__ == '__main__':
     waves_22050 = outs[0]
     soundfile.write('tmp/example.wav', waves_22050, 22_050)
 
-    outs = tts.synthesize_batch([
+    outs = tts.synthesize([
         SynthesisInput(text="Сбейте лестницу!", stress=True, timbre_wave_24k=wave_24k, prosody_wave_24k=wave_24k),
     ])
     waves_22050 = outs[0]
