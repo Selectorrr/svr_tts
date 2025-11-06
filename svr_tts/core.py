@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
+from onnxruntime import SessionOptions
 from tqdm import tqdm
 
 from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade
@@ -95,6 +96,7 @@ class SVR_TTS:
     def __init__(self, api_key, tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
                  providers: Sequence[str | tuple[str, dict[Any, Any]]] | None = None,
                  provider_options: Sequence[dict[Any, Any]] | None = None,
+                 session_options: SessionOptions | None = None,
                  timbre_cache_dir='workspace/voices/') -> None:
         """
         Инициализация объектов инференс-сессий для всех моделей.
@@ -109,19 +111,19 @@ class SVR_TTS:
         cache_dir = self._get_cache_dir()
         os.environ["TQDM_POSITION"] = "-1"
         self.base_model = ort.InferenceSession(self._download("base", cache_dir), providers=providers,
-                                               provider_options=provider_options)
+                                               provider_options=provider_options, sess_options=session_options)
         self.cfe_model = ort.InferenceSession(self._download("cfe", cache_dir), providers=providers,
-                                               provider_options=provider_options)
+                                               provider_options=provider_options, sess_options=session_options)
         self.semantic_model = ort.InferenceSession(self._download("semantic", cache_dir), providers=providers,
-                                                   provider_options=provider_options)
+                                                   provider_options=provider_options, sess_options=session_options)
         self.encoder_model = ort.InferenceSession(self._download("encoder", cache_dir), providers=providers,
-                                                  provider_options=provider_options)
+                                                  provider_options=provider_options, sess_options=session_options)
         self.style_model = ort.InferenceSession(self._download("style", cache_dir), providers=providers,
-                                                provider_options=provider_options)
+                                                provider_options=provider_options, sess_options=session_options)
         self.estimator_model = ort.InferenceSession(self._download("estimator", cache_dir), providers=providers,
-                                                    provider_options=provider_options)
+                                                    provider_options=provider_options, sess_options=session_options)
         self.vocoder_model = ort.InferenceSession(self._download("vocoder", cache_dir), providers=providers,
-                                                  provider_options=provider_options)
+                                                  provider_options=provider_options, sess_options=session_options)
         if api_key:
             api_key = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
         self.api_key = api_key
@@ -209,6 +211,22 @@ class SVR_TTS:
             "latent_input": latent_input
         })[0]
         return wave_22050[0]
+
+    def compute_style(self, wave_24k):
+        speaker_style = self.style_model.run(["speaker_style"], {
+            "wave_24k": wave_24k
+        })
+        return speaker_style[0]
+
+    def compute_semantic(self, wave_24k):
+        feat, feat_len = self.cfe_model.run(
+            ["feat", "feat_len"], {
+                "wave_24k": wave_24k
+            })
+        semantic = self.semantic_model.run(None, {
+            'input_features': feat.astype(np.float32)
+        })[0][:, :feat_len]
+        return semantic
 
     def synthesize_batch(self, inputs: List[SynthesisInput],
                          duration_or_speed: float = None,
@@ -305,7 +323,7 @@ class SVR_TTS:
             synthesized_audios.append(np.concatenate(generated_chunks))
         return synthesized_audios
 
-    def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None):
+    def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40):
         split_inputs = []
         mapping = []
 
@@ -318,7 +336,7 @@ class SVR_TTS:
                     text=chunk_text,
                     stress=inp.stress,
                     timbre_wave_24k=inp.timbre_wave_24k,
-                    prosody_wave_24k=prepare_prosody(chunk_prosody, INPUT_SR)
+                    prosody_wave_24k=prepare_prosody(chunk_prosody, INPUT_SR, rtrim_top_db)
                 ))
             mapping.append((idx, len(chunks)))
 
