@@ -16,10 +16,11 @@ limitations under the License.
 import base64
 import logging
 import os
+import re
 import traceback
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, HfApi
 from onnxruntime import SessionOptions
 from tqdm import tqdm
 
@@ -51,9 +52,6 @@ INPUT_SR = 24_000
 OUTPUT_SR = 22_050
 FADE_LEN = int(0.1 * OUTPUT_SR)
 
-logger = logging.getLogger(__name__)
-
-
 class SynthesisInput(NamedTuple):
     """
     Структура входных данных для синтеза речи.
@@ -83,47 +81,34 @@ class SVR_TTS:
     """
 
     REPO_ID = "selectorrrr/svr-tts-large"
-    MODEL_FILES = {
-        "base": "svr_base_v3.onnx",
-        "semantic": "svr_semantic.onnx",
-        "encoder": "svr_encoder_v1.onnx",
-        "style": "svr_style.onnx",
-        "estimator": "svr_estimator.onnx",
-        "vocoder": "svr_vocoder.onnx",
-        "cfe": "svr_cfe.onnx",
-    }
 
     def __init__(self, api_key, tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
                  providers: Sequence[str | tuple[str, dict[Any, Any]]] | None = None,
                  provider_options: Sequence[dict[Any, Any]] | None = None,
                  session_options: SessionOptions | None = None,
-                 timbre_cache_dir='workspace/voices/') -> None:
+                 timbre_cache_dir='workspace/voices/',
+                 user_models_dir: str | None = None) -> None:  # добавлено
         """
         Инициализация объектов инференс-сессий для всех моделей.
-
-        Аргументы:
-            tokenizer_service_url: URL для REST-сервиса токенизации.
-            providers: список провайдеров для ONNX-моделей (например, CUDA или CPU).
         """
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.tokenizer_service_url = tokenizer_service_url
         cache_dir = self._get_cache_dir()
         os.environ["TQDM_POSITION"] = "-1"
-        self.base_model = ort.InferenceSession(self._download("base", cache_dir), providers=providers,
-                                               provider_options=provider_options, sess_options=session_options)
-        self.cfe_model = ort.InferenceSession(self._download("cfe", cache_dir), providers=providers,
-                                               provider_options=provider_options, sess_options=session_options)
-        self.semantic_model = ort.InferenceSession(self._download("semantic", cache_dir), providers=providers,
-                                                   provider_options=provider_options, sess_options=session_options)
-        self.encoder_model = ort.InferenceSession(self._download("encoder", cache_dir), providers=providers,
-                                                  provider_options=provider_options, sess_options=session_options)
-        self.style_model = ort.InferenceSession(self._download("style", cache_dir), providers=providers,
-                                                provider_options=provider_options, sess_options=session_options)
-        self.estimator_model = ort.InferenceSession(self._download("estimator", cache_dir), providers=providers,
-                                                    provider_options=provider_options, sess_options=session_options)
-        self.vocoder_model = ort.InferenceSession(self._download("vocoder", cache_dir), providers=providers,
-                                                  provider_options=provider_options, sess_options=session_options)
+
+        # где искать локальные onnx (если передали)
+        self._user_models_dir = Path(user_models_dir).expanduser() if user_models_dir else None
+
+        # единая логика загрузки моделей (автоподбор по ключу + версии)
+        self.base_model      = ort.InferenceSession(self._resolve("base", cache_dir),      providers=providers, provider_options=provider_options, sess_options=session_options)
+        self.cfe_model       = ort.InferenceSession(self._resolve("cfe", cache_dir),       providers=providers, provider_options=provider_options, sess_options=session_options)
+        self.semantic_model  = ort.InferenceSession(self._resolve("semantic", cache_dir),  providers=providers, provider_options=provider_options, sess_options=session_options)
+        self.encoder_model   = ort.InferenceSession(self._resolve("encoder", cache_dir),   providers=providers, provider_options=provider_options, sess_options=session_options)
+        self.style_model     = ort.InferenceSession(self._resolve("style", cache_dir),     providers=providers, provider_options=provider_options, sess_options=session_options)
+        self.estimator_model = ort.InferenceSession(self._resolve("estimator", cache_dir), providers=providers, provider_options=provider_options, sess_options=session_options)
+        self.vocoder_model   = ort.InferenceSession(self._resolve("vocoder", cache_dir),   providers=providers, provider_options=provider_options, sess_options=session_options)
+
         if api_key:
             api_key = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
         self.api_key = api_key
@@ -135,8 +120,63 @@ class SVR_TTS:
         os.makedirs(cache_dir, exist_ok=True)
         return cache_dir
 
+    # ----- единый селектор имени -----
+    @staticmethod
+    def _pick_best_name(key: str, names: list[str]) -> str | None:
+        """
+        Выбираем *.onnx, чьё имя содержит key:
+        - максимальная версия по суффиксу _vN (если нет — v0)
+        - при равенстве версии берём более длинное имя
+        """
+        key_l = key.lower()
+        best_ver = -1
+        best_len = -1
+        best_name: str | None = None
+
+        for raw in names:
+            n = raw.split("/")[-1]
+            nl = n.lower()
+            if key_l not in nl or not nl.endswith(".onnx"):
+                continue
+            m = re.search(r"_v(\d+)\.onnx$", nl)
+            ver = int(m.group(1)) if m else 0
+            name_len = len(nl)
+
+            if (ver > best_ver) or (ver == best_ver and name_len > best_len):
+                best_ver, best_len, best_name = ver, name_len, n
+
+        return best_name
+
+    def _resolve(self, key: str, cache_dir: str) -> str:
+        """
+        1) user_models_dir: ищем *.onnx по key с выбором версии (_vN).
+        2) HF: тот же отбор версий среди файлов репозитория.
+        Если нигде не нашли — FileNotFoundError.
+        """
+        logger = logging.getLogger("SVR_TTS")
+
+        # локальные кандидаты
+        if self._user_models_dir:
+            local_names = [p.name for p in self._user_models_dir.glob("*.onnx")]
+            best_local = self._pick_best_name(key, local_names)
+            if best_local:
+                lp = (self._user_models_dir / best_local)
+                if lp.is_file():
+                    resolved = str(lp.resolve())
+                    print(f"[{key}] using LOCAL model: {best_local} ({resolved})")
+                    return resolved
+
+        # HF
+        return self._download(key, cache_dir)
+
     def _download(self, key: str, cache_dir: str) -> str:
-        return hf_hub_download(repo_id=self.REPO_ID, filename=self.MODEL_FILES[key], cache_dir=cache_dir)
+        files = HfApi().list_repo_files(self.REPO_ID)
+        best = self._pick_best_name(key, files)
+        if not best:
+            raise FileNotFoundError(f"Не нашли модель '{key}' ни локально, ни в HF репозитории {self.REPO_ID}.")
+        path = hf_hub_download(repo_id=self.REPO_ID, filename=best, cache_dir=cache_dir)
+        print(f"[{key}] using HF model: {best} (cached at {path})")
+        return path
 
     def _tokenize(self, token_inputs: List[dict]) -> dict:
         """
