@@ -163,7 +163,6 @@ class SVR_TTS:
                 lp = (self._user_models_dir / best_local)
                 if lp.is_file():
                     resolved = str(lp.resolve())
-                    print(f"[{key}] using LOCAL model: {best_local} ({resolved})")
                     return resolved
 
         # HF
@@ -175,7 +174,6 @@ class SVR_TTS:
         if not best:
             raise FileNotFoundError(f"Не нашли модель '{key}' ни локально, ни в HF репозитории {self.REPO_ID}.")
         path = hf_hub_download(repo_id=self.REPO_ID, filename=best, cache_dir=cache_dir)
-        print(f"[{key}] using HF model: {best} (cached at {path})")
         return path
 
     def _tokenize(self, token_inputs: List[dict]) -> dict:
