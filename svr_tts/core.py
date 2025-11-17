@@ -82,38 +82,106 @@ class SVR_TTS:
 
     REPO_ID = "selectorrrr/svr-tts-large"
 
-    def __init__(self, api_key, tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
+    def __init__(self, api_key,
+                 tokenizer_service_url: str = "https://synthvoice.ru/tokenize_batch",
                  providers: Sequence[str | tuple[str, dict[Any, Any]]] | None = None,
                  provider_options: Sequence[dict[Any, Any]] | None = None,
                  session_options: SessionOptions | None = None,
-                 timbre_cache_dir='workspace/voices/',
-                 user_models_dir: str | None = None) -> None:  # добавлено
+                 timbre_cache_dir: str = 'workspace/voices/',
+                 user_models_dir: str | None = None,
+                 reinit_every: int = 32,
+                 dur_norm_low: float = 5.0,
+                 dur_norm_high: float = 16.0) -> None:
         """
-        Инициализация объектов инференс-сессий для всех моделей.
+        reinit_every — после какого количества обработанных current_input
+        переинициализировать onnx-сессии.
+        Если reinit_every <= 0 — реинициализация отключена.
         """
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        self._providers = providers
+        self._provider_options = provider_options
+        self._session_options = session_options
+        self._reinit_every = int(reinit_every)
+        self._processed_since_reinit = 0
+        self.dur_norm_low = dur_norm_low
+        self.dur_norm_high = dur_norm_high
+
         self.tokenizer_service_url = tokenizer_service_url
-        cache_dir = self._get_cache_dir()
+        self._cache_dir = self._get_cache_dir()
         os.environ["TQDM_POSITION"] = "-1"
 
-        # где искать локальные onnx (если передали)
         self._user_models_dir = Path(user_models_dir).expanduser() if user_models_dir else None
 
-        # единая логика загрузки моделей (автоподбор по ключу + версии)
-        self.base_model      = ort.InferenceSession(self._resolve("base", cache_dir),      providers=providers, provider_options=provider_options, sess_options=session_options)
-        self.cfe_model       = ort.InferenceSession(self._resolve("cfe", cache_dir),       providers=providers, provider_options=provider_options, sess_options=session_options)
-        self.semantic_model  = ort.InferenceSession(self._resolve("semantic", cache_dir),  providers=providers, provider_options=provider_options, sess_options=session_options)
-        self.encoder_model   = ort.InferenceSession(self._resolve("encoder", cache_dir),   providers=providers, provider_options=provider_options, sess_options=session_options)
-        self.style_model     = ort.InferenceSession(self._resolve("style", cache_dir),     providers=providers, provider_options=provider_options, sess_options=session_options)
-        self.estimator_model = ort.InferenceSession(self._resolve("estimator", cache_dir), providers=providers, provider_options=provider_options, sess_options=session_options)
-        self.vocoder_model   = ort.InferenceSession(self._resolve("vocoder", cache_dir),   providers=providers, provider_options=provider_options, sess_options=session_options)
+        self._init_sessions()
 
         if api_key:
             api_key = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
         self.api_key = api_key
+
         self._timbre_cache_dir = Path(os.path.join(timbre_cache_dir, "timbre_cache"))
         self._timbre_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _init_sessions(self) -> None:
+        cache_dir = self._cache_dir
+
+        self.base_model      = ort.InferenceSession(
+            self._resolve("base", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+        self.cfe_model       = ort.InferenceSession(
+            self._resolve("cfe", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+        self.semantic_model  = ort.InferenceSession(
+            self._resolve("semantic", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+        self.encoder_model   = ort.InferenceSession(
+            self._resolve("encoder", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+        self.style_model     = ort.InferenceSession(
+            self._resolve("style", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+        self.estimator_model = ort.InferenceSession(
+            self._resolve("estimator", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+        self.vocoder_model   = ort.InferenceSession(
+            self._resolve("vocoder", cache_dir),
+            providers=self._providers,
+            provider_options=self._provider_options,
+            sess_options=self._session_options,
+        )
+
+    def _maybe_reinit_sessions(self) -> None:
+        """
+        Увеличивает счётчик обработанных элементов и при необходимости
+        реинициализирует onnx-сессии.
+        Если self._reinit_every <= 0 — ничего не делает.
+        """
+        if self._reinit_every <= 0:
+            return
+
+        self._processed_since_reinit += 1
+        if self._processed_since_reinit >= self._reinit_every:
+            self._init_sessions()
+            self._processed_since_reinit = 0
 
     def _get_cache_dir(self) -> str:
         cache_dir = user_cache_dir("svr_tts", "SynthVoiceRu")
@@ -293,6 +361,7 @@ class SVR_TTS:
                 tqdm(inputs, desc=tokenize_resp['desc'], **tqdm_kwargs)):
             if not tokenize_resp['tokens'][idx]:
                 synthesized_audios.append(None)
+                self._maybe_reinit_sessions()
                 continue
             timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
             prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
@@ -300,7 +369,7 @@ class SVR_TTS:
             # Если не задана скорость, рассчитаем длительность
             if not is_speed and not duration_or_speed:
                 duration = len(prosody_wave) / 24000
-                duration_or_speed, _ = target_duration(duration, len(current_input.text))
+                duration_or_speed, _ = target_duration(duration, len(current_input.text), self.dur_norm_low, self.dur_norm_high)
 
             # Получение базовых признаков через базовую модель
             wave_24k, _ = \
@@ -360,6 +429,9 @@ class SVR_TTS:
 
             # Объединяем все сегменты в одно аудио
             synthesized_audios.append(np.concatenate(generated_chunks))
+
+            self._maybe_reinit_sessions()
+
         return synthesized_audios
 
     def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40):
