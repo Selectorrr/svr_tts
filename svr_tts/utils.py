@@ -175,3 +175,21 @@ def mute_fade(y, sr, mute_ms=45, fade_ms=5):
         e = min(m + f, y.size)
         y[m:e] *= np.linspace(0.0, 1.0, e - m, dtype=y.dtype)
     return y
+
+def target_duration(sec: float, n_chars: int, low: float = 5.0, high: float = 16.0):
+    """
+    sec      — исходная длительность аудио (сек)
+    n_chars  — кол-во англ. букв
+    low/high — допустимый диапазон букв/с
+    return: (target_sec, stretch)
+    """
+    if sec <= 0 or n_chars <= 0:
+        return sec, 1.0
+    cps = n_chars / sec
+    if cps < low:         # слишком медленно → укоротить
+        tgt = n_chars / low
+    elif cps > high:      # слишком быстро → удлинить
+        tgt = n_chars / high
+    else:                 # ок → без изменений
+        tgt = sec
+    return tgt, (tgt / sec)

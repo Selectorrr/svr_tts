@@ -24,7 +24,7 @@ from huggingface_hub import hf_hub_download, HfApi
 from onnxruntime import SessionOptions
 from tqdm import tqdm
 
-from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade
+from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, target_duration
 
 """
 Модуль синтеза речи с использованием нескольких моделей ONNX.
@@ -299,7 +299,8 @@ class SVR_TTS:
 
             # Если не задана скорость, рассчитаем длительность
             if not is_speed and not duration_or_speed:
-                duration_or_speed = len(prosody_wave) / 24000
+                duration = len(prosody_wave) / 24000
+                duration_or_speed, _ = target_duration(duration, len(current_input.text))
 
             # Получение базовых признаков через базовую модель
             wave_24k, _ = \
