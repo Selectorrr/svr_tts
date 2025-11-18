@@ -244,7 +244,7 @@ class SVR_TTS:
         path = hf_hub_download(repo_id=self.REPO_ID, filename=best, cache_dir=cache_dir)
         return path
 
-    def _tokenize(self, token_inputs: List[dict]) -> dict:
+    def _tokenize(self, token_inputs) -> dict:
         """
         Отправляет данные для токенизации к REST-сервису и возвращает результат.
 
@@ -335,6 +335,7 @@ class SVR_TTS:
         return semantic
 
     def synthesize_batch(self, inputs: List[SynthesisInput],
+                         stress_exclusions: Dict[str, Any] = {},
                          duration_or_speed: float = None,
                          is_speed: bool = False,
                          scaling_min: float = 0.875,
@@ -348,13 +349,15 @@ class SVR_TTS:
             is_speed: True, если задается скорость речи, False если продолжительность.
             scaling_min: минимальный коэффициент масштабирования.
             scaling_max: максимальный коэффициент масштабирования.
+            stress_exclusions: слова исключения для расстановки ударений
 
         Возвращает:
             Список numpy-массивов, каждый из которых представляет сгенерированное аудио.
         """
         synthesized_audios: List[Optional[np.ndarray]] = []
-        token_list = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
-        tokenize_resp = self._tokenize(token_list)
+        items = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
+        tokenize_req = {"items":items, "exclusions": stress_exclusions}
+        tokenize_resp = self._tokenize(tokenize_req)
         # Обработка каждого элемента входных данных
         tqdm_kwargs = tqdm_kwargs or {}
         for idx, current_input in enumerate(
@@ -434,7 +437,8 @@ class SVR_TTS:
 
         return synthesized_audios
 
-    def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40):
+    def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40,
+                   stress_exclusions: Dict[str, Any] = {}):
         split_inputs = []
         mapping = []
 
@@ -452,7 +456,7 @@ class SVR_TTS:
             mapping.append((idx, len(chunks)))
 
         try:
-            all_waves = self.synthesize_batch(split_inputs, tqdm_kwargs=tqdm_kwargs)
+            all_waves = self.synthesize_batch(split_inputs, stress_exclusions, tqdm_kwargs=tqdm_kwargs)
         except Exception as e:
             traceback.print_exc()
             all_waves = [None] * len(split_inputs)
