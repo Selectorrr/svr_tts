@@ -193,3 +193,18 @@ def target_duration(sec: float, n_chars: int, low: float = 5.0, high: float = 16
     else:                 # ок → без изменений
         tgt = sec
     return tgt, (tgt / sec)
+
+def extend_wave(wave: np.ndarray, duration_scale: float) -> np.ndarray:
+    if duration_scale <= 0:
+        return wave
+
+    if abs(duration_scale - 1.0) < 1e-6:
+        return wave
+
+    orig_len = len(wave)
+    target_len = int(round(orig_len * duration_scale))
+
+    reps = int(np.ceil(target_len / orig_len))
+    tiled = np.tile(wave, reps)
+
+    return tiled[:target_len]

@@ -24,7 +24,7 @@ from huggingface_hub import hf_hub_download, HfApi
 from onnxruntime import SessionOptions
 from tqdm import tqdm
 
-from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, target_duration
+from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, target_duration, extend_wave
 
 """
 Модуль синтеза речи с использованием нескольких моделей ONNX.
@@ -91,7 +91,7 @@ class SVR_TTS:
                  user_models_dir: str | None = None,
                  reinit_every: int = 32,
                  dur_norm_low: float = 5.0,
-                 dur_norm_high: float = 16.0) -> None:
+                 dur_norm_high: float = 20.0) -> None:
         """
         reinit_every — после какого количества обработанных current_input
         переинициализировать onnx-сессии.
@@ -338,8 +338,8 @@ class SVR_TTS:
                          stress_exclusions: Dict[str, Any] = {},
                          duration_or_speed: float = None,
                          is_speed: bool = False,
-                         scaling_min: float = 0.875,
-                         scaling_max: float = 1.3, tqdm_kwargs: Dict[str, Any] = None) -> List[np.ndarray]:
+                         scaling_min: float = float('-inf'),
+                         scaling_max: float = float('inf'), tqdm_kwargs: Dict[str, Any] = None) -> List[np.ndarray]:
         """
         Синтезирует аудио для каждого элемента входного списка.
 
@@ -372,7 +372,10 @@ class SVR_TTS:
             # Если не задана скорость, рассчитаем длительность
             if not is_speed and not duration_or_speed:
                 duration = len(prosody_wave) / 24000
-                duration_or_speed, _ = target_duration(duration, len(current_input.text), self.dur_norm_low, self.dur_norm_high)
+                target_duration_or_speed, duration_scale = target_duration(duration, len(current_input.text), self.dur_norm_low, self.dur_norm_high)
+                prosody_wave = extend_wave(prosody_wave, duration_scale)
+            else:
+                target_duration_or_speed = duration_or_speed
 
             # Получение базовых признаков через базовую модель
             wave_24k, _ = \
@@ -380,7 +383,7 @@ class SVR_TTS:
                     ["wave_24k", "duration"], {
                         "input_ids": np.expand_dims(tokenize_resp['tokens'][idx], 0),
                         "prosody_wave_24k": prosody_wave,
-                        "duration_or_speed": np.array([duration_or_speed], dtype=np.float32),
+                        "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
                         "is_speed": np.array([is_speed], dtype=bool),
                         "scaling_min": np.array([scaling_min], dtype=np.float32),
                         "scaling_max": np.array([scaling_max], dtype=np.float32)
