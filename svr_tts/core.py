@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import traceback
+from itertools import zip_longest
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download, HfApi
@@ -358,11 +359,15 @@ class SVR_TTS:
         items = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_req = {"items":items, "exclusions": stress_exclusions}
         tokenize_resp = self._tokenize(tokenize_req)
+        tokens = tokenize_resp.get('tokens') or []
         # Обработка каждого элемента входных данных
         tqdm_kwargs = tqdm_kwargs or {}
-        for idx, current_input in enumerate(
-                tqdm(inputs, desc=tokenize_resp['desc'], **tqdm_kwargs)):
-            if not tokenize_resp['tokens'][idx]:
+        for current_input, cur_tokens in zip_longest(
+                tqdm(inputs, desc=tokenize_resp.get('desc', ''), **tqdm_kwargs),
+                tokens,
+                fillvalue=None,
+        ):
+            if not cur_tokens:
                 synthesized_audios.append(None)
                 self._maybe_reinit_sessions()
                 continue
@@ -381,7 +386,7 @@ class SVR_TTS:
             wave_24k, _ = \
                 self.base_model.run(
                     ["wave_24k", "duration"], {
-                        "input_ids": np.expand_dims(tokenize_resp['tokens'][idx], 0),
+                        "input_ids": np.expand_dims(cur_tokens, 0),
                         "prosody_wave_24k": prosody_wave,
                         "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
                         "is_speed": np.array([is_speed], dtype=bool),
