@@ -367,81 +367,88 @@ class SVR_TTS:
                 tokens,
                 fillvalue=None,
         ):
-            if not cur_tokens:
+            try:
+                if not cur_tokens:
+                    synthesized_audios.append(None)
+                    self._maybe_reinit_sessions()
+                    continue
+                timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
+                prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
+
+                # Если не задана скорость, рассчитаем длительность
+                if not is_speed and not duration_or_speed:
+                    duration = len(prosody_wave) / 24000
+                    target_duration_or_speed, duration_scale = target_duration(duration, len(current_input.text),
+                                                                               self.dur_norm_low, self.dur_norm_high)
+                    prosody_wave = extend_wave(prosody_wave, duration_scale)
+                else:
+                    target_duration_or_speed = duration_or_speed
+
+                # Получение базовых признаков через базовую модель
+                wave_24k, _ = \
+                    self.base_model.run(
+                        ["wave_24k", "duration"], {
+                            "input_ids": np.expand_dims(cur_tokens, 0),
+                            "prosody_wave_24k": prosody_wave,
+                            "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
+                            "is_speed": np.array([is_speed], dtype=bool),
+                            "scaling_min": np.array([scaling_min], dtype=np.float32),
+                            "scaling_max": np.array([scaling_max], dtype=np.float32)
+                        })
+
+                min_len = min(len(timbre_wave), len(prosody_wave))
+                timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
+                speaker_style = self.compute_style(timbre_wave)
+
+                # Получаем условия для дальнейшего кодирования и генерации
+                cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
+                    self.encoder_model.run(
+                        ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
+                         "prompt_length"], {
+                            "wave_24k": wave_24k,
+                            "semantic_wave": self.compute_semantic(wave_24k),
+                            "prosody_wave": timbre_wave,
+                            "semantic_timbre": self.compute_semantic(timbre_wave)
+                        }))
+
+                generated_chunks: List[np.ndarray] = []
+                prev_overlap_chunk: Optional[np.ndarray] = None
+
+                # Обработка каждого сегмента аудио
+                for seg_idx, seg_length in enumerate(data_lengths):
+                    segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
+                                                            latent_features[seg_idx],
+                                                            time_span,
+                                                            int(seg_length),
+                                                            prompt_features[seg_idx],
+                                                            speaker_style,
+                                                            prompt_length)
+                    # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
+                    if seg_idx == 0:
+                        mute_fade(segment_wave, OUTPUT_SR)
+                        chunk = segment_wave[:-OVERLAP_LENGTH]
+                        generated_chunks.append(chunk)
+                        prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+                    # Если это последний сегмент, осуществляем окончательное склеивание
+                    elif seg_idx == len(data_lengths) - 1:
+                        chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
+                        generated_chunks.append(chunk)
+                        break
+                    # Для всех промежуточных сегментов
+                    else:
+                        chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
+                        generated_chunks.append(chunk)
+                        prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+
+                # Объединяем все сегменты в одно аудио
+                synthesized_audios.append(np.concatenate(generated_chunks))
+
+                self._maybe_reinit_sessions()
+            except Exception as e:
+                traceback.print_exc()
                 synthesized_audios.append(None)
                 self._maybe_reinit_sessions()
                 continue
-            timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
-            prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
-
-            # Если не задана скорость, рассчитаем длительность
-            if not is_speed and not duration_or_speed:
-                duration = len(prosody_wave) / 24000
-                target_duration_or_speed, duration_scale = target_duration(duration, len(current_input.text), self.dur_norm_low, self.dur_norm_high)
-                prosody_wave = extend_wave(prosody_wave, duration_scale)
-            else:
-                target_duration_or_speed = duration_or_speed
-
-            # Получение базовых признаков через базовую модель
-            wave_24k, _ = \
-                self.base_model.run(
-                    ["wave_24k", "duration"], {
-                        "input_ids": np.expand_dims(cur_tokens, 0),
-                        "prosody_wave_24k": prosody_wave,
-                        "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
-                        "is_speed": np.array([is_speed], dtype=bool),
-                        "scaling_min": np.array([scaling_min], dtype=np.float32),
-                        "scaling_max": np.array([scaling_max], dtype=np.float32)
-                    })
-
-            min_len = min(len(timbre_wave), len(prosody_wave))
-            timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
-            speaker_style = self.compute_style(timbre_wave)
-
-            # Получаем условия для дальнейшего кодирования и генерации
-            cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
-                self.encoder_model.run(
-                    ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
-                     "prompt_length"], {
-                        "wave_24k": wave_24k,
-                        "semantic_wave": self.compute_semantic(wave_24k),
-                        "prosody_wave": timbre_wave,
-                        "semantic_timbre": self.compute_semantic(timbre_wave)
-                    }))
-
-            generated_chunks: List[np.ndarray] = []
-            prev_overlap_chunk: Optional[np.ndarray] = None
-
-            # Обработка каждого сегмента аудио
-            for seg_idx, seg_length in enumerate(data_lengths):
-                segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
-                                                        latent_features[seg_idx],
-                                                        time_span,
-                                                        int(seg_length),
-                                                        prompt_features[seg_idx],
-                                                        speaker_style,
-                                                        prompt_length)
-                # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
-                if seg_idx == 0:
-                    mute_fade(segment_wave, OUTPUT_SR)
-                    chunk = segment_wave[:-OVERLAP_LENGTH]
-                    generated_chunks.append(chunk)
-                    prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-                # Если это последний сегмент, осуществляем окончательное склеивание
-                elif seg_idx == len(data_lengths) - 1:
-                    chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
-                    generated_chunks.append(chunk)
-                    break
-                # Для всех промежуточных сегментов
-                else:
-                    chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
-                    generated_chunks.append(chunk)
-                    prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-
-            # Объединяем все сегменты в одно аудио
-            synthesized_audios.append(np.concatenate(generated_chunks))
-
-            self._maybe_reinit_sessions()
 
         return synthesized_audios
 
@@ -479,12 +486,14 @@ class SVR_TTS:
             ok = True
 
             for seg_idx in range(count):
-                wave_22050 = all_waves[wave_idx]
-                wave_idx += 1
+                wave_22050 = all_waves[wave_idx + seg_idx]
+
+                if not ok:
+                    continue
 
                 if wave_22050 is None:
                     ok = False
-                    break
+                    continue
 
                 if seg_idx == 0:
                     generated_chunks.append(wave_22050[:-OVERLAP_LEN])
@@ -497,6 +506,10 @@ class SVR_TTS:
                     generated_chunks.append(chunk)
                     prev_overlap_chunk = wave_22050[-OVERLAP_LEN:]
 
-            merged.append(np.concatenate(generated_chunks) if ok else None)
+            wave_idx += count
+            if ok and generated_chunks:
+                merged.append(np.concatenate(generated_chunks))
+            else:
+                merged.append(None)
 
         return merged
