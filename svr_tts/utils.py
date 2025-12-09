@@ -202,7 +202,7 @@ def extend_wave(wave: np.ndarray, duration_scale: float) -> np.ndarray:
         return wave
 
     orig_len = len(wave)
-    target_len = int(round(orig_len * duration_scale))
+    target_len = max(int(round(orig_len * duration_scale)), 24_000)
 
     reps = int(np.ceil(target_len / orig_len))
     tiled = np.tile(wave, reps)

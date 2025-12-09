@@ -496,7 +496,10 @@ class SVR_TTS:
                     continue
 
                 if seg_idx == 0:
-                    generated_chunks.append(wave_22050[:-OVERLAP_LEN])
+                    if count > 1:
+                        generated_chunks.append(wave_22050[:-OVERLAP_LEN])
+                    else:
+                        generated_chunks.append(wave_22050)
                     prev_overlap_chunk = wave_22050[-OVERLAP_LEN:]
                 elif seg_idx == count - 1:
                     chunk = _crossfade(prev_overlap_chunk, wave_22050, OVERLAP_LEN)
