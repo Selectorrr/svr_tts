@@ -92,7 +92,8 @@ class SVR_TTS:
                  user_models_dir: str | None = None,
                  reinit_every: int = 32,
                  dur_norm_low: float = 5.0,
-                 dur_norm_high: float = 20.0) -> None:
+                 dur_norm_high: float = 20.0,
+                 prosody_cond: float = 0.6) -> None:
         """
         reinit_every — после какого количества обработанных current_input
         переинициализировать onnx-сессии.
@@ -123,6 +124,7 @@ class SVR_TTS:
 
         self._timbre_cache_dir = Path(os.path.join(timbre_cache_dir, "timbre_cache"))
         self._timbre_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.prosody_cond = prosody_cond
 
     def _init_sessions(self) -> None:
         cache_dir = self._cache_dir
@@ -393,7 +395,8 @@ class SVR_TTS:
                             "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
                             "is_speed": np.array([is_speed], dtype=bool),
                             "scaling_min": np.array([scaling_min], dtype=np.float32),
-                            "scaling_max": np.array([scaling_max], dtype=np.float32)
+                            "scaling_max": np.array([scaling_max], dtype=np.float32),
+                            "prosody_cond": np.array([self.prosody_cond], dtype=np.float32)
                         })
 
                 min_len = min(len(timbre_wave), len(prosody_wave))
