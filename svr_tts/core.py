@@ -21,11 +21,13 @@ import traceback
 from itertools import zip_longest
 from pathlib import Path
 
+import resampy
 from huggingface_hub import hf_hub_download, HfApi
 from onnxruntime import SessionOptions
 from tqdm import tqdm
 
-from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, target_duration, extend_wave
+from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, target_duration, extend_wave, \
+    istft_ola
 
 """
 Модуль синтеза речи с использованием нескольких моделей ONNX.
@@ -93,7 +95,9 @@ class SVR_TTS:
                  reinit_every: int = 32,
                  dur_norm_low: float = 5.0,
                  dur_norm_high: float = 20.0,
-                 prosody_cond: float = 0.6) -> None:
+                 prosody_cond: float = 0.6,
+                 max_text_len: int = 150,
+                 vc_type: str = 'native_bigvgan') -> None:
         """
         reinit_every — после какого количества обработанных current_input
         переинициализировать onnx-сессии.
@@ -116,6 +120,7 @@ class SVR_TTS:
 
         self._user_models_dir = Path(user_models_dir).expanduser() if user_models_dir else None
 
+        self.vc_type = vc_type
         self._init_sessions()
 
         if api_key:
@@ -125,6 +130,8 @@ class SVR_TTS:
         self._timbre_cache_dir = Path(os.path.join(timbre_cache_dir, "timbre_cache"))
         self._timbre_cache_dir.mkdir(parents=True, exist_ok=True)
         self.prosody_cond = prosody_cond
+        self.max_text_len = max_text_len
+
 
     def _init_sessions(self) -> None:
         cache_dir = self._cache_dir
@@ -165,12 +172,24 @@ class SVR_TTS:
             provider_options=self._provider_options,
             sess_options=self._session_options,
         )
-        self.vocoder_model   = ort.InferenceSession(
-            self._resolve("vocoder", cache_dir),
-            providers=self._providers,
-            provider_options=self._provider_options,
-            sess_options=self._session_options,
-        )
+
+        if self.vc_type == 'native_bigvgan':
+            self.vocoder_model = ort.InferenceSession(
+                self._resolve("vocoder", cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
+        elif self.vc_type == 'native_vocos':
+            self.vocoder_model = ort.InferenceSession(
+                hf_hub_download(repo_id="BSC-LT/vocos-mel-22khz",
+                                filename="mel_spec_22khz_univ.onnx",
+                                cache_dir=cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
+
 
     def _maybe_reinit_sessions(self) -> None:
         """
@@ -316,10 +335,16 @@ class SVR_TTS:
 
         # Генерация аудио через вокодер
         latent_input = latent_input[:, :, prompt_length:]
-        wave_22050 = self.vocoder_model.run(["wave_22050"], {
+        if self.vc_type == 'native_bigvgan':
+            wave_22050 = self.vocoder_model.run(["wave_22050"], {
             "latent_input": latent_input
-        })[0]
-        return wave_22050[0]
+            })[0]
+            return wave_22050[0]
+        elif self.vc_type == 'native_vocos':
+            wave_22050 = self.vocos_decode(self.vocoder_model, latent_input)
+            return wave_22050
+        else:
+            raise NotImplementedError
 
     def compute_style(self, wave_24k):
         speaker_style = self.style_model.run(["speaker_style"], {
@@ -399,52 +424,56 @@ class SVR_TTS:
                             "prosody_cond": np.array([self.prosody_cond], dtype=np.float32)
                         })
 
-                min_len = min(len(timbre_wave), len(prosody_wave))
-                timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
-                speaker_style = self.compute_style(timbre_wave)
+                if self.vc_type:
+                    min_len = min(len(timbre_wave), len(prosody_wave))
+                    timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
+                    speaker_style = self.compute_style(timbre_wave)
 
-                # Получаем условия для дальнейшего кодирования и генерации
-                cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
-                    self.encoder_model.run(
-                        ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
-                         "prompt_length"], {
-                            "wave_24k": wave_24k,
-                            "semantic_wave": self.compute_semantic(wave_24k),
-                            "prosody_wave": timbre_wave,
-                            "semantic_timbre": self.compute_semantic(timbre_wave)
-                        }))
+                    # Получаем условия для дальнейшего кодирования и генерации
+                    cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
+                        self.encoder_model.run(
+                            ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
+                             "prompt_length"], {
+                                "wave_24k": wave_24k,
+                                "semantic_wave": self.compute_semantic(wave_24k),
+                                "prosody_wave": timbre_wave,
+                                "semantic_timbre": self.compute_semantic(timbre_wave)
+                            }))
 
-                generated_chunks: List[np.ndarray] = []
-                prev_overlap_chunk: Optional[np.ndarray] = None
+                    generated_chunks: List[np.ndarray] = []
+                    prev_overlap_chunk: Optional[np.ndarray] = None
 
-                # Обработка каждого сегмента аудио
-                for seg_idx, seg_length in enumerate(data_lengths):
-                    segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
-                                                            latent_features[seg_idx],
-                                                            time_span,
-                                                            int(seg_length),
-                                                            prompt_features[seg_idx],
-                                                            speaker_style,
-                                                            prompt_length)
-                    # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
-                    if seg_idx == 0:
-                        mute_fade(segment_wave, OUTPUT_SR)
-                        chunk = segment_wave[:-OVERLAP_LENGTH]
-                        generated_chunks.append(chunk)
-                        prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-                    # Если это последний сегмент, осуществляем окончательное склеивание
-                    elif seg_idx == len(data_lengths) - 1:
-                        chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
-                        generated_chunks.append(chunk)
-                        break
-                    # Для всех промежуточных сегментов
-                    else:
-                        chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
-                        generated_chunks.append(chunk)
-                        prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+                    # Обработка каждого сегмента аудио
+                    for seg_idx, seg_length in enumerate(data_lengths):
+                        segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
+                                                                latent_features[seg_idx],
+                                                                time_span,
+                                                                int(seg_length),
+                                                                prompt_features[seg_idx],
+                                                                speaker_style,
+                                                                prompt_length)
+                        # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
+                        if seg_idx == 0:
+                            mute_fade(segment_wave, OUTPUT_SR)
+                            chunk = segment_wave[:-OVERLAP_LENGTH]
+                            generated_chunks.append(chunk)
+                            prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+                        # Если это последний сегмент, осуществляем окончательное склеивание
+                        elif seg_idx == len(data_lengths) - 1:
+                            chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
+                            generated_chunks.append(chunk)
+                            break
+                        # Для всех промежуточных сегментов
+                        else:
+                            chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
+                            generated_chunks.append(chunk)
+                            prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
 
-                # Объединяем все сегменты в одно аудио
-                synthesized_audios.append(np.concatenate(generated_chunks))
+                    # Объединяем все сегменты в одно аудио
+                    synthesized_audios.append(np.concatenate(generated_chunks))
+                else:
+                    result = resampy.resample(wave_24k, INPUT_SR, OUTPUT_SR)
+                    synthesized_audios.append(result)
 
                 self._maybe_reinit_sessions()
             except Exception as e:
@@ -455,13 +484,13 @@ class SVR_TTS:
 
         return synthesized_audios
 
-    def synthesize(self, inputs, max_text_len=150, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40,
+    def synthesize(self, inputs, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40,
                    stress_exclusions: Dict[str, Any] = {}):
         split_inputs = []
         mapping = []
 
         for idx, inp in enumerate(inputs):
-            chunks = split_text(inp.text, max_text_len)
+            chunks = split_text(inp.text, self.max_text_len)
             chunks = split_audio(inp.prosody_wave_24k, chunks)
 
             for chunk_text, chunk_prosody in chunks:
@@ -519,3 +548,19 @@ class SVR_TTS:
                 merged.append(None)
 
         return merged
+
+    def vocos_decode(self, sess: ort.InferenceSession, mel: np.ndarray,
+                     n_fft: int = 1024, hop: int = 256) -> np.ndarray:
+        """
+        mel: float32 [B, 80, T]
+        return: float32 [T_wav]
+        """
+        assert mel.ndim == 3 and mel.shape[1] == 80, f"mel shape {mel.shape}"
+
+        mag, xr, yi = sess.run(None, {'mels': mel})
+        spec = (mag.astype(np.float32)) * (xr.astype(np.float32) + 1j * yi.astype(np.float32))
+
+        result = istft_ola(spec.astype(np.complex64), n_fft=n_fft, hop=hop)
+
+        result = resampy.resample(result, INPUT_SR, OUTPUT_SR)
+        return result
