@@ -1,3 +1,4 @@
+import math
 import re
 from typing import List
 from typing import Optional, Callable, Tuple
@@ -362,13 +363,31 @@ def mute_fade(y, sr, mute_ms=45, fade_ms=5):
     return y
 
 
-def target_duration(sec: float, n_chars: int, low: float = 5.0, high: float = 16.0):
+def max_cps_log(dur_sec: float, cps_min=14.0, cps_max=19.0, t0=1.0, t1=30.0, k=15.0) -> float:
+    # clamp dur to [t0..t1]
+    if dur_sec <= t0:
+        return cps_min
+    if dur_sec >= t1:
+        return cps_max
+
+    # normalize to 0..1
+    x = (dur_sec - t0) / (t1 - t0)
+
+    # log-like saturating curve in 0..1
+    # k controls curvature: bigger k = быстрее растёт в начале и сильнее насыщается
+    y = math.log1p(k * x) / math.log1p(k)
+
+    return cps_min + (cps_max - cps_min) * y
+
+
+def target_duration(sec: float, n_chars: int, low: float = 5.0, t0=1.0, t1=30.0, k=15.0):
     """
     sec      — исходная длительность аудио (сек)
     n_chars  — кол-во англ. букв
     low/high — допустимый диапазон букв/с
     return: (target_sec, stretch)
     """
+    high = max_cps_log(sec, t0=t0, t1=t1, k=k)
     if sec <= 0 or n_chars <= 0:
         return sec, 1.0
     cps = n_chars / sec
@@ -433,3 +452,13 @@ def istft_ola(spec: np.ndarray, n_fft: int = 1024, hop: int = 256) -> np.ndarray
     y = (y / env[None, :]).astype(np.float32)
 
     return y[0]  # первый батч
+
+def ensure_min(prosody_wave: np.ndarray, sr: int = 24000, min_sec: float = 3.0) -> np.ndarray:
+    y = np.asarray(prosody_wave, dtype=np.float32).reshape(-1)
+    min_len = int(min_sec * sr)
+
+    if y.size >= min_len:
+        return y
+
+    reps = int(np.ceil(min_len / y.size))  # сколько раз повторить
+    return np.tile(y, reps)[:min_len]

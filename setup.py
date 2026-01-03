@@ -18,7 +18,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='svr_tts',
-    version='0.9.12',
+    version='0.10.3',
     packages=find_packages(),
     install_requires=[
         'onnxruntime-gpu',
@@ -27,6 +27,7 @@ setup(
         'appdirs',
         'tqdm',
         'requests',
+        'resampy'
     ],
     author='Selector',
     description='Синтез речи'

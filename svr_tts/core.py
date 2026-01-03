@@ -23,6 +23,7 @@ from pathlib import Path
 
 import resampy
 from huggingface_hub import hf_hub_download, HfApi
+from numpy.typing import NDArray
 from onnxruntime import SessionOptions
 from tqdm import tqdm
 
@@ -41,7 +42,7 @@ from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, 
 что сервис токенизации доступен.
 """
 
-from typing import NamedTuple, List, Any, Optional, Sequence, Dict
+from typing import NamedTuple, List, Any, Optional, Sequence, Dict, Callable
 import numpy as np
 # noinspection PyPackageRequirements
 import onnxruntime as ort
@@ -52,8 +53,7 @@ from appdirs import user_cache_dir
 OVERLAP_LENGTH = 4096
 EPS = 1e-8
 INPUT_SR = 24_000
-OUTPUT_SR = 22_050
-FADE_LEN = int(0.1 * OUTPUT_SR)
+
 
 class SynthesisInput(NamedTuple):
     """
@@ -71,6 +71,10 @@ class SynthesisInput(NamedTuple):
     prosody_wave_24k: np.ndarray
 
 
+VcFn = Callable[
+    [NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]],
+    NDArray[np.float32],
+]
 
 
 class SVR_TTS:
@@ -94,10 +98,14 @@ class SVR_TTS:
                  user_models_dir: str | None = None,
                  reinit_every: int = 32,
                  dur_norm_low: float = 5.0,
-                 dur_norm_high: float = 20.0,
+                 dur_high_t0=1.0,
+                 dur_high_t1=30.0,
+                 dur_high_k=15.0,
                  prosody_cond: float = 0.6,
                  max_text_len: int = 150,
-                 vc_type: str = 'native_bigvgan') -> None:
+                 vc_type: str = 'native_bigvgan',
+                 min_prosody_len: float = 3.0,
+                 vc_func: VcFn = None) -> None:
         """
         reinit_every — после какого количества обработанных current_input
         переинициализировать onnx-сессии.
@@ -112,7 +120,9 @@ class SVR_TTS:
         self._reinit_every = int(reinit_every)
         self._processed_since_reinit = 0
         self.dur_norm_low = dur_norm_low
-        self.dur_norm_high = dur_norm_high
+        self.dur_high_t0 = dur_high_t0
+        self.dur_high_t1 = dur_high_t1
+        self.dur_high_k = dur_high_k
 
         self.tokenizer_service_url = tokenizer_service_url
         self._cache_dir = self._get_cache_dir()
@@ -132,35 +142,42 @@ class SVR_TTS:
         self.prosody_cond = prosody_cond
         self.max_text_len = max_text_len
 
+        if vc_type and not vc_func:
+            self.OUTPUT_SR = 22_050
+        else:
+            self.OUTPUT_SR = 24_000
+        self.FADE_LEN = int(0.1 * self.OUTPUT_SR)
+        self.min_prosody_len = min_prosody_len
+        self.vc_func = vc_func
 
     def _init_sessions(self) -> None:
         cache_dir = self._cache_dir
 
-        self.base_model      = ort.InferenceSession(
+        self.base_model = ort.InferenceSession(
             self._resolve("base", cache_dir),
             providers=self._providers,
             provider_options=self._provider_options,
             sess_options=self._session_options,
         )
-        self.cfe_model       = ort.InferenceSession(
+        self.cfe_model = ort.InferenceSession(
             self._resolve("cfe", cache_dir),
             providers=self._providers,
             provider_options=self._provider_options,
             sess_options=self._session_options,
         )
-        self.semantic_model  = ort.InferenceSession(
+        self.semantic_model = ort.InferenceSession(
             self._resolve("semantic", cache_dir),
             providers=self._providers,
             provider_options=self._provider_options,
             sess_options=self._session_options,
         )
-        self.encoder_model   = ort.InferenceSession(
+        self.encoder_model = ort.InferenceSession(
             self._resolve("encoder", cache_dir),
             providers=self._providers,
             provider_options=self._provider_options,
             sess_options=self._session_options,
         )
-        self.style_model     = ort.InferenceSession(
+        self.style_model = ort.InferenceSession(
             self._resolve("style", cache_dir),
             providers=self._providers,
             provider_options=self._provider_options,
@@ -189,7 +206,6 @@ class SVR_TTS:
                 provider_options=self._provider_options,
                 sess_options=self._session_options,
             )
-
 
     def _maybe_reinit_sessions(self) -> None:
         """
@@ -337,7 +353,7 @@ class SVR_TTS:
         latent_input = latent_input[:, :, prompt_length:]
         if self.vc_type == 'native_bigvgan':
             wave_22050 = self.vocoder_model.run(["wave_22050"], {
-            "latent_input": latent_input
+                "latent_input": latent_input
             })[0]
             return wave_22050[0]
         elif self.vc_type == 'native_vocos':
@@ -384,7 +400,7 @@ class SVR_TTS:
         """
         synthesized_audios: List[Optional[np.ndarray]] = []
         items = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
-        tokenize_req = {"items":items, "exclusions": stress_exclusions}
+        tokenize_req = {"items": items, "exclusions": stress_exclusions}
         tokenize_resp = self._tokenize(tokenize_req)
         tokens = tokenize_resp.get('tokens') or []
         # Обработка каждого элемента входных данных
@@ -404,19 +420,25 @@ class SVR_TTS:
 
                 # Если не задана скорость, рассчитаем длительность
                 if not is_speed and not duration_or_speed:
-                    duration = len(prosody_wave) / 24000
+                    duration = len(prosody_wave) / INPUT_SR
                     target_duration_or_speed, duration_scale = target_duration(duration, len(current_input.text),
-                                                                               self.dur_norm_low, self.dur_norm_high)
+                                                                               self.dur_norm_low, self.dur_high_t0,
+                                                                               self.dur_high_t1, self.dur_high_k)
                     prosody_wave = extend_wave(prosody_wave, duration_scale)
                 else:
                     target_duration_or_speed = duration_or_speed
+
+                if len(prosody_wave) / INPUT_SR < self.min_prosody_len:
+                    prosody_wave_24k = timbre_wave
+                else:
+                    prosody_wave_24k = prosody_wave
 
                 # Получение базовых признаков через базовую модель
                 wave_24k, _ = \
                     self.base_model.run(
                         ["wave_24k", "duration"], {
                             "input_ids": np.expand_dims(cur_tokens, 0),
-                            "prosody_wave_24k": prosody_wave,
+                            "prosody_wave_24k": prosody_wave_24k,
                             "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
                             "is_speed": np.array([is_speed], dtype=bool),
                             "scaling_min": np.array([scaling_min], dtype=np.float32),
@@ -424,7 +446,7 @@ class SVR_TTS:
                             "prosody_cond": np.array([self.prosody_cond], dtype=np.float32)
                         })
 
-                if self.vc_type:
+                if not self.vc_func and self.vc_type:
                     min_len = min(len(timbre_wave), len(prosody_wave))
                     timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
                     speaker_style = self.compute_style(timbre_wave)
@@ -454,7 +476,7 @@ class SVR_TTS:
                                                                 prompt_length)
                         # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
                         if seg_idx == 0:
-                            mute_fade(segment_wave, OUTPUT_SR)
+                            mute_fade(segment_wave, self.OUTPUT_SR)
                             chunk = segment_wave[:-OVERLAP_LENGTH]
                             generated_chunks.append(chunk)
                             prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
@@ -472,8 +494,7 @@ class SVR_TTS:
                     # Объединяем все сегменты в одно аудио
                     synthesized_audios.append(np.concatenate(generated_chunks))
                 else:
-                    result = resampy.resample(wave_24k, INPUT_SR, OUTPUT_SR)
-                    synthesized_audios.append(result)
+                    synthesized_audios.append(wave_24k)
 
                 self._maybe_reinit_sessions()
             except Exception as e:
@@ -510,40 +531,44 @@ class SVR_TTS:
 
         merged = []
         wave_idx = 0
-        OVERLAP_LEN = FADE_LEN
+        OVERLAP_LEN = self.FADE_LEN
 
-        for _, count in mapping:
+        for idx, count in mapping:
             generated_chunks = []
             prev_overlap_chunk = None
             ok = True
 
             for seg_idx in range(count):
-                wave_22050 = all_waves[wave_idx + seg_idx]
+                wave = all_waves[wave_idx + seg_idx]
 
                 if not ok:
                     continue
 
-                if wave_22050 is None:
+                if wave is None:
                     ok = False
                     continue
 
                 if seg_idx == 0:
                     if count > 1:
-                        generated_chunks.append(wave_22050[:-OVERLAP_LEN])
+                        generated_chunks.append(wave[:-OVERLAP_LEN])
                     else:
-                        generated_chunks.append(wave_22050)
-                    prev_overlap_chunk = wave_22050[-OVERLAP_LEN:]
+                        generated_chunks.append(wave)
+                    prev_overlap_chunk = wave[-OVERLAP_LEN:]
                 elif seg_idx == count - 1:
-                    chunk = _crossfade(prev_overlap_chunk, wave_22050, OVERLAP_LEN)
+                    chunk = _crossfade(prev_overlap_chunk, wave, OVERLAP_LEN)
                     generated_chunks.append(chunk)
                 else:
-                    chunk = _crossfade(prev_overlap_chunk, wave_22050[:-OVERLAP_LEN], OVERLAP_LEN)
+                    chunk = _crossfade(prev_overlap_chunk, wave[:-OVERLAP_LEN], OVERLAP_LEN)
                     generated_chunks.append(chunk)
-                    prev_overlap_chunk = wave_22050[-OVERLAP_LEN:]
+                    prev_overlap_chunk = wave[-OVERLAP_LEN:]
 
             wave_idx += count
             if ok and generated_chunks:
-                merged.append(np.concatenate(generated_chunks))
+                result_24k = np.concatenate(generated_chunks)
+                if self.vc_func:
+                    i = inputs[idx]
+                    result_24k = self.vc_func(result_24k, i.timbre_wave_24k, i.prosody_wave_24k)
+                merged.append(result_24k)
             else:
                 merged.append(None)
 
@@ -562,5 +587,5 @@ class SVR_TTS:
 
         result = istft_ola(spec.astype(np.complex64), n_fft=n_fft, hop=hop)
 
-        result = resampy.resample(result, INPUT_SR, OUTPUT_SR)
+        result = resampy.resample(result, INPUT_SR, self.OUTPUT_SR)
         return result
