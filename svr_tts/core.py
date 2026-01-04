@@ -493,6 +493,9 @@ class SVR_TTS:
 
                     # Объединяем все сегменты в одно аудио
                     synthesized_audios.append(np.concatenate(generated_chunks))
+                elif self.vc_func:
+                    wave_24k = self.vc_func(wave_24k, current_input.timbre_wave_24k, current_input.prosody_wave_24k)
+                    synthesized_audios.append(wave_24k)
                 else:
                     synthesized_audios.append(wave_24k)
 
@@ -565,9 +568,6 @@ class SVR_TTS:
             wave_idx += count
             if ok and generated_chunks:
                 result_24k = np.concatenate(generated_chunks)
-                if self.vc_func:
-                    i = inputs[idx]
-                    result_24k = self.vc_func(result_24k, i.timbre_wave_24k, i.prosody_wave_24k)
                 merged.append(result_24k)
             else:
                 merged.append(None)
