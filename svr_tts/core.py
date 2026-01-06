@@ -101,6 +101,7 @@ class SVR_TTS:
                  dur_high_t0=1.0,
                  dur_high_t1=30.0,
                  dur_high_k=15.0,
+                 cps_min=14.0,
                  prosody_cond: float = 0.6,
                  max_text_len: int = 150,
                  vc_type: str = 'native_bigvgan',
@@ -123,6 +124,7 @@ class SVR_TTS:
         self.dur_high_t0 = dur_high_t0
         self.dur_high_t1 = dur_high_t1
         self.dur_high_k = dur_high_k
+        self.cps_min = cps_min
 
         self.tokenizer_service_url = tokenizer_service_url
         self._cache_dir = self._get_cache_dir()
@@ -423,7 +425,7 @@ class SVR_TTS:
                     duration = len(prosody_wave) / INPUT_SR
                     target_duration_or_speed, duration_scale = target_duration(duration, len(current_input.text),
                                                                                self.dur_norm_low, self.dur_high_t0,
-                                                                               self.dur_high_t1, self.dur_high_k)
+                                                                               self.dur_high_t1, self.dur_high_k, self.cps_min)
                     prosody_wave = extend_wave(prosody_wave, duration_scale)
                 else:
                     target_duration_or_speed = duration_or_speed

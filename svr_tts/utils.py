@@ -380,14 +380,14 @@ def max_cps_log(dur_sec: float, cps_min=14.0, cps_max=19.0, t0=1.0, t1=30.0, k=1
     return cps_min + (cps_max - cps_min) * y
 
 
-def target_duration(sec: float, n_chars: int, low: float = 5.0, t0=1.0, t1=30.0, k=15.0):
+def target_duration(sec: float, n_chars: int, low: float = 5.0, t0=1.0, t1=30.0, k=15.0, cps_min=14.0):
     """
     sec      — исходная длительность аудио (сек)
     n_chars  — кол-во англ. букв
     low/high — допустимый диапазон букв/с
     return: (target_sec, stretch)
     """
-    high = max_cps_log(sec, t0=t0, t1=t1, k=k)
+    high = max_cps_log(sec, cps_min=cps_min, t0=t0, t1=t1, k=k)
     if sec <= 0 or n_chars <= 0:
         return sec, 1.0
     cps = n_chars / sec
