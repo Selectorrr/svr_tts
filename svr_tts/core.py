@@ -27,8 +27,7 @@ from numpy.typing import NDArray
 from onnxruntime import SessionOptions
 from tqdm import tqdm
 
-from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, target_duration, extend_wave, \
-    istft_ola
+from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, istft_ola
 
 """
 Модуль синтеза речи с использованием нескольких моделей ONNX.
@@ -106,6 +105,11 @@ class SVR_TTS:
                  max_text_len: int = 150,
                  vc_type: str = 'native_bigvgan',
                  min_prosody_len: float = 3.0,
+                 speed_search_attempts: int = 6,
+                 speed_match_tolerance_pct: float = 3.0,
+                 speed_clip_min: float = 0.5,
+                 speed_clip_max: float = 2.0,
+                 speed_adjust_step_pct: float = 0.08,
                  vc_func: VcFn = None) -> None:
         """
         reinit_every — после какого количества обработанных current_input
@@ -151,6 +155,13 @@ class SVR_TTS:
         self.FADE_LEN = int(0.1 * self.OUTPUT_SR)
         self.min_prosody_len = min_prosody_len
         self.vc_func = vc_func
+
+        # Автоподбор скорости (когда duration_or_speed не задан)
+        self.speed_search_attempts = int(speed_search_attempts)
+        self.speed_match_tolerance = float(speed_match_tolerance_pct)
+        self.speed_clip_min = float(speed_clip_min)
+        self.speed_clip_max = float(speed_clip_max)
+        self.speed_adjust_step_pct = float(speed_adjust_step_pct)
 
     def _init_sessions(self) -> None:
         cache_dir = self._cache_dir
@@ -380,6 +391,150 @@ class SVR_TTS:
         })[0][:, :feat_len]
         return semantic
 
+    def _clip_speed(self, speed: float) -> float:
+        # Clip speed into a sane range to avoid model instability
+        if speed < self.speed_clip_min:
+            return self.speed_clip_min
+        if speed > self.speed_clip_max:
+            return self.speed_clip_max
+        return float(speed)
+
+    def _synthesize_base(self,
+                         cur_tokens: np.ndarray,
+                         prosody_wave_24k: np.ndarray,
+                         duration_or_speed: float,
+                         is_speed: bool,
+                         scaling_min: float,
+                         scaling_max: float) -> np.ndarray:
+        wave_24k, _ = self.base_model.run(
+            ["wave_24k", "duration"], {
+                "input_ids": np.expand_dims(cur_tokens, 0),
+                "prosody_wave_24k": prosody_wave_24k,
+                "duration_or_speed": np.array([duration_or_speed], dtype=np.float32),
+                "is_speed": np.array([is_speed], dtype=bool),
+                "scaling_min": np.array([scaling_min], dtype=np.float32),
+                "scaling_max": np.array([scaling_max], dtype=np.float32),
+                "prosody_cond": np.array([self.prosody_cond], dtype=np.float32)
+            })
+        return wave_24k
+
+    def _synthesize_with_speed_search(self,
+                                      cur_tokens: np.ndarray,
+                                      prosody_wave_24k: np.ndarray,
+                                      target_sec: float,
+                                      scaling_min: float,
+                                      scaling_max: float) -> tuple[np.ndarray, float, float]:
+        """
+        Автоподбор скорости под целевую длительность с минимальным числом вызовов _synthesize_base.
+
+        Стратегия:
+          - Сразу стартуем с максимальной скорости (обычно нужно ускорять).
+          - Если упёрлись в границу (min/max) и всё равно вне допусков — дальше пытаться бессмысленно.
+          - После первого синтеза оцениваем "базовую длительность": base_sec ≈ out_sec * speed0
+            и прыгаем на speed ≈ base_sec / target_sec.
+          - Далее до N уточнений фиксированным мультипликативным шагом (1 + step_pct).
+        """
+        target_sec = float(target_sec)
+        if target_sec <= 0:
+            wave = self._synthesize_base(cur_tokens, prosody_wave_24k, 1.0, True, scaling_min, scaling_max)
+            return wave, 1.0, 0.0
+
+        EPS_S = 1e-6
+        s_min = float(self.speed_clip_min)
+        s_max = float(self.speed_clip_max)
+
+        def rel_err(out_s: float) -> float:
+            return abs(out_s - target_sec) / max(target_sec, EPS)
+
+        def unfixable_at_bound(speed: float, out_s: float) -> bool:
+            # На max скорости всё ещё слишком длинно => ускорять уже нельзя
+            if speed >= s_max - EPS_S and out_s > target_sec * (1.0 + self.speed_match_tolerance):
+                return True
+            # На min скорости всё ещё слишком коротко => замедлять уже нельзя
+            if speed <= s_min + EPS_S and out_s < target_sec * (1.0 - self.speed_match_tolerance):
+                return True
+            return False
+
+        # best-результат
+        best_wave: Optional[np.ndarray] = None
+        best_speed: float = 1.0
+        best_err: float = float("inf")
+
+        def synth_eval(speed: float) -> tuple[np.ndarray, float, float]:
+            """Синтез + расчёт out_sec/err + обновление best."""
+            nonlocal best_wave, best_speed, best_err
+            speed = self._clip_speed(float(speed))
+
+            wave_24k = self._synthesize_base(cur_tokens, prosody_wave_24k, speed, True, scaling_min, scaling_max)
+            out_sec = float(wave_24k.shape[-1]) / float(INPUT_SR)
+            err = rel_err(out_sec)
+
+            if err < best_err:
+                best_err = err
+                best_speed = speed
+                best_wave = wave_24k
+
+            return wave_24k, out_sec, err
+
+        # 1) Старт: максимальная скорость
+        speed = self._clip_speed(s_max)
+        wave_24k, out_sec, err = synth_eval(speed)
+
+        if err <= self.speed_match_tolerance:
+            return best_wave, best_speed, best_err
+
+        if unfixable_at_bound(speed, out_sec):
+            return best_wave, best_speed, best_err
+
+        # 2) Прыжок на предсказанную скорость: base_sec ≈ out_sec * speed
+        base_sec_est = out_sec * speed
+        speed_pred = self._clip_speed(base_sec_est / max(target_sec, EPS))
+
+        if abs(speed_pred - best_speed) > EPS_S:
+            wave_24k, out_sec, err = synth_eval(speed_pred)
+
+            if err <= self.speed_match_tolerance:
+                return best_wave, best_speed, best_err
+
+            if unfixable_at_bound(best_speed, out_sec):
+                return best_wave, best_speed, best_err
+
+        # 3) Уточнение шагом (1 + step_pct)
+        step = float(self.speed_adjust_step_pct)
+        if step <= 0.0 or self.speed_search_attempts <= 0:
+            return best_wave, best_speed, best_err
+
+        mult = 1.0 + step
+
+        for _ in range(self.speed_search_attempts):
+            # Направление по последнему измерению out_sec:
+            # длиннее цели -> ускоряем; короче -> замедляем
+            if out_sec > target_sec:
+                if best_speed >= s_max - EPS_S:
+                    break
+                next_speed = best_speed * mult
+            else:
+                if best_speed <= s_min + EPS_S:
+                    break
+                next_speed = best_speed / mult
+
+            next_speed = self._clip_speed(next_speed)
+
+            # Если следующий шаг упирается в границу и ситуация "неисправима" — можно прекращать
+            if unfixable_at_bound(next_speed, out_sec):
+                break
+
+            wave_24k, out_sec, err = synth_eval(next_speed)
+
+            if err <= self.speed_match_tolerance:
+                break
+
+            # Если после синтеза выяснилось, что мы в "неисправимой" зоне на границе — прекращаем
+            if unfixable_at_bound(best_speed, out_sec):
+                break
+
+        return best_wave, best_speed, best_err
+
     def synthesize_batch(self, inputs: List[SynthesisInput],
                          stress_exclusions: Dict[str, Any] = {},
                          duration_or_speed: float = None,
@@ -420,33 +575,43 @@ class SVR_TTS:
                 timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
                 prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
 
-                # Если не задана скорость, рассчитаем длительность
-                if not is_speed and not duration_or_speed:
-                    duration = len(prosody_wave) / INPUT_SR
-                    target_duration_or_speed, duration_scale = target_duration(duration, len(current_input.text),
-                                                                               self.dur_norm_low, self.dur_high_t0,
-                                                                               self.dur_high_t1, self.dur_high_k, self.cps_min)
-                    prosody_wave = extend_wave(prosody_wave, duration_scale)
-                else:
-                    target_duration_or_speed = duration_or_speed
+                # Цель по длительности — длительность просодии (в секундах)
+                target_sec = len(prosody_wave) / float(INPUT_SR)
 
-                if len(prosody_wave) / INPUT_SR < self.min_prosody_len:
+                # Просодия: если слишком короткая — подмешиваем тембр вместо просодии
+                if target_sec < float(self.min_prosody_len):
                     prosody_wave_24k = timbre_wave
                 else:
                     prosody_wave_24k = prosody_wave
 
-                # Получение базовых признаков через базовую модель
-                wave_24k, _ = \
-                    self.base_model.run(
-                        ["wave_24k", "duration"], {
-                            "input_ids": np.expand_dims(cur_tokens, 0),
-                            "prosody_wave_24k": prosody_wave_24k,
-                            "duration_or_speed": np.array([target_duration_or_speed], dtype=np.float32),
-                            "is_speed": np.array([is_speed], dtype=bool),
-                            "scaling_min": np.array([scaling_min], dtype=np.float32),
-                            "scaling_max": np.array([scaling_max], dtype=np.float32),
-                            "prosody_cond": np.array([self.prosody_cond], dtype=np.float32)
-                        })
+                # 1) Если duration_or_speed задан — работаем как раньше (внешний контроль)
+                # 2) Иначе — автоподбор скорости: сначала speed=1.0, затем N попыток, ранняя остановка
+                if duration_or_speed is not None:
+                    wave_24k = self._synthesize_base(
+                        cur_tokens,
+                        prosody_wave_24k,
+                        float(duration_or_speed),
+                        bool(is_speed),
+                        scaling_min,
+                        scaling_max,
+                    )
+                else:
+                    wave_24k, best_speed, best_err = self._synthesize_with_speed_search(
+                        cur_tokens,
+                        prosody_wave_24k,
+                        target_sec,
+                        scaling_min,
+                        scaling_max,
+                    )
+                    # debug info (не шумим в stdout)
+                    logging.getLogger(__name__).debug(
+                        "Auto speed fit: speed=%.4f err=%.2f%% target=%.3fs out=%.3fs text_len=%d",
+                        best_speed,
+                        best_err * 100.0,
+                        target_sec,
+                        wave_24k.shape[-1] / float(INPUT_SR),
+                        len(current_input.text),
+                    )
 
                 if not self.vc_func and self.vc_type:
                     min_len = min(len(timbre_wave), len(prosody_wave))
