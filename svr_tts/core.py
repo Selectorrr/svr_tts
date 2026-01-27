@@ -118,7 +118,7 @@ class SVR_TTS:
         """
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-
+        self.vc_func = vc_func
         self._providers = providers
         self._provider_options = provider_options
         self._session_options = session_options
@@ -154,7 +154,6 @@ class SVR_TTS:
             self.OUTPUT_SR = 24_000
         self.FADE_LEN = int(0.1 * self.OUTPUT_SR)
         self.min_prosody_len = min_prosody_len
-        self.vc_func = vc_func
 
         # Автоподбор скорости (когда duration_or_speed не задан)
         self.speed_search_attempts = int(speed_search_attempts)
@@ -172,53 +171,55 @@ class SVR_TTS:
             provider_options=self._provider_options,
             sess_options=self._session_options,
         )
-        self.cfe_model = ort.InferenceSession(
-            self._resolve("cfe", cache_dir),
-            providers=self._providers,
-            provider_options=self._provider_options,
-            sess_options=self._session_options,
-        )
-        self.semantic_model = ort.InferenceSession(
-            self._resolve("semantic", cache_dir),
-            providers=self._providers,
-            provider_options=self._provider_options,
-            sess_options=self._session_options,
-        )
-        self.encoder_model = ort.InferenceSession(
-            self._resolve("encoder", cache_dir),
-            providers=self._providers,
-            provider_options=self._provider_options,
-            sess_options=self._session_options,
-        )
-        self.style_model = ort.InferenceSession(
-            self._resolve("style", cache_dir),
-            providers=self._providers,
-            provider_options=self._provider_options,
-            sess_options=self._session_options,
-        )
-        self.estimator_model = ort.InferenceSession(
-            self._resolve("estimator", cache_dir),
-            providers=self._providers,
-            provider_options=self._provider_options,
-            sess_options=self._session_options,
-        )
+        if not self.vc_func:
+            self.cfe_model = ort.InferenceSession(
+                self._resolve("cfe", cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
+            self.semantic_model = ort.InferenceSession(
+                self._resolve("semantic", cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
+            self.encoder_model = ort.InferenceSession(
+                self._resolve("encoder", cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
+            self.style_model = ort.InferenceSession(
+                self._resolve("style", cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
+            self.estimator_model = ort.InferenceSession(
+                self._resolve("estimator", cache_dir),
+                providers=self._providers,
+                provider_options=self._provider_options,
+                sess_options=self._session_options,
+            )
 
-        if self.vc_type == 'native_bigvgan':
-            self.vocoder_model = ort.InferenceSession(
-                self._resolve("vocoder", cache_dir),
-                providers=self._providers,
-                provider_options=self._provider_options,
-                sess_options=self._session_options,
-            )
-        elif self.vc_type == 'native_vocos':
-            self.vocoder_model = ort.InferenceSession(
-                hf_hub_download(repo_id="BSC-LT/vocos-mel-22khz",
-                                filename="mel_spec_22khz_univ.onnx",
-                                cache_dir=cache_dir),
-                providers=self._providers,
-                provider_options=self._provider_options,
-                sess_options=self._session_options,
-            )
+            if self.vc_type == 'native_bigvgan':
+                self.vocoder_model = ort.InferenceSession(
+                    self._resolve("vocoder", cache_dir),
+                    providers=self._providers,
+                    provider_options=self._provider_options,
+                    sess_options=self._session_options,
+                )
+            elif self.vc_type == 'native_vocos':
+                self.vocoder_model = ort.InferenceSession(
+                    hf_hub_download(repo_id="BSC-LT/vocos-mel-22khz",
+                                    filename="mel_spec_22khz_univ.onnx",
+                                    cache_dir=cache_dir),
+                    providers=self._providers,
+                    provider_options=self._provider_options,
+                    sess_options=self._session_options,
+                )
+
 
     def _maybe_reinit_sessions(self) -> None:
         """
