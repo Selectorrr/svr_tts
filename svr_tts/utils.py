@@ -7,13 +7,13 @@ import numpy as np
 
 
 def split_text(
-    text: str,
-    max_text_len: int,
-    splitter: str = r'(?<=[.!?…])\s+',
-    *,
-    soft_ratio: float = 1.25,
-    hard_ratio: float = 1.60,
-    min_chars: int = 70,
+        text: str,
+        max_text_len: int,
+        splitter: str = r'(?<=[.!?…])\s+',
+        *,
+        soft_ratio: float = 1.25,
+        hard_ratio: float = 1.60,
+        min_chars: int = 70,
 ) -> List[str]:
     def _normalize(s: str) -> str:
         return re.sub(r"\s+", " ", s.strip())
@@ -201,7 +201,6 @@ def split_text(
 
     chunks = _rebalance_tail(chunks)
     return [_normalize(c) for c in chunks if c and c.strip()]
-
 
 
 def split_audio(prosody_wave_24k: np.ndarray,
@@ -415,6 +414,7 @@ def extend_wave(wave: np.ndarray, duration_scale: float) -> np.ndarray:
 
     return tiled[:target_len]
 
+
 def istft_ola(spec: np.ndarray, n_fft: int = 1024, hop: int = 256) -> np.ndarray:
     """
     spec: complex64 [B, N, T] (N = n_fft//2+1)
@@ -462,3 +462,4 @@ def ensure_min(prosody_wave: np.ndarray, sr: int = 24000, min_sec: float = 3.0) 
 
     reps = int(np.ceil(min_len / y.size))  # сколько раз повторить
     return np.tile(y, reps)[:min_len]
+

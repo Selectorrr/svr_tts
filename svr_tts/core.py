@@ -105,16 +105,33 @@ class SVR_TTS:
                  max_text_len: int = 150,
                  vc_type: str = 'native_bigvgan',
                  min_prosody_len: float = 3.0,
+
+                # ---------- автоподбор скорости ----------
                  speed_search_attempts: int = 6,
-                 speed_match_tolerance_pct: float = 3.0,
                  speed_clip_min: float = 0.5,
                  speed_clip_max: float = 2.0,
                  speed_adjust_step_pct: float = 0.08,
-                 vc_func: VcFn = None) -> None:
+
+                # ---------- допуск по длительности (зависит от длины реплики) ----------
+                len_t_short: float = 1.0,
+                len_t_long: float = 15.0,
+
+                max_longer_pct_short: float = 0.35,
+                max_longer_pct_long: float = 0.15,
+
+                max_shorter_pct_short: float = 0.25,
+                max_shorter_pct_long: float = 0.10,
+
+                vc_func: VcFn = None) -> None:
         """
         reinit_every — после какого количества обработанных current_input
         переинициализировать onnx-сессии.
         Если reinit_every <= 0 — реинициализация отключена.
+
+        Пояснение по допускам:
+        - len_t_short / len_t_long задают “короткие” и “длинные” реплики (в секундах).
+        - max_*_pct_short применяются к коротким, max_*_pct_long к длинным.
+        - между ними допуск меняется постепенно.
         """
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -155,12 +172,22 @@ class SVR_TTS:
         self.FADE_LEN = int(0.1 * self.OUTPUT_SR)
         self.min_prosody_len = min_prosody_len
 
-        # Автоподбор скорости (когда duration_or_speed не задан)
+        # ---------- параметры автоподбора скорости ----------
         self.speed_search_attempts = int(speed_search_attempts)
-        self.speed_match_tolerance = float(speed_match_tolerance_pct)
         self.speed_clip_min = float(speed_clip_min)
         self.speed_clip_max = float(speed_clip_max)
         self.speed_adjust_step_pct = float(speed_adjust_step_pct)
+
+        # ---------- параметры допусков по длительности ----------
+        self.len_t_short = float(len_t_short)
+        self.len_t_long = float(len_t_long)
+
+        self.max_longer_pct_short = float(max_longer_pct_short)
+        self.max_longer_pct_long = float(max_longer_pct_long)
+
+        self.max_shorter_pct_short = float(max_shorter_pct_short)
+        self.max_shorter_pct_long = float(max_shorter_pct_long)
+
 
     def _init_sessions(self) -> None:
         cache_dir = self._cache_dir
@@ -419,6 +446,43 @@ class SVR_TTS:
             })
         return wave_24k
 
+    @staticmethod
+    def _lerp(a: float, b: float, k: float) -> float:
+        return a + (b - a) * k
+
+    def _interp_by_len(self, t_sec: float, short_val: float, long_val: float) -> float:
+        """Плавно меняем значение от short_val (короткие) к long_val (длинные)."""
+        t0 = self.len_t_short
+        t1 = self.len_t_long
+        if t1 <= t0 + 1e-9:
+            return float(long_val)
+        if t_sec <= t0:
+            return float(short_val)
+        if t_sec >= t1:
+            return float(long_val)
+        k = (t_sec - t0) / (t1 - t0)
+        return float(self._lerp(short_val, long_val, k))
+
+    def _length_allowances(self, target_sec: float) -> tuple[float, float]:
+        """
+        Возвращает (allow_longer, allow_shorter) в долях:
+        allow_longer=0.15 значит можно до +15%,
+        allow_shorter=0.10 значит можно до -10%.
+        """
+        t = float(target_sec)
+        allow_longer = self._interp_by_len(t, self.max_longer_pct_short, self.max_longer_pct_long)
+        allow_shorter = self._interp_by_len(t, self.max_shorter_pct_short, self.max_shorter_pct_long)
+        # на всякий случай
+        return max(0.0, allow_longer), max(0.0, allow_shorter)
+
+    def _length_bounds(self, target_sec: float) -> tuple[float, float]:
+        """Нижняя/верхняя граница длительности результата (в секундах)."""
+        allow_longer, allow_shorter = self._length_allowances(target_sec)
+        low = float(target_sec) * (1.0 - allow_shorter)
+        high = float(target_sec) * (1.0 + allow_longer)
+        return low, high
+
+
     def _synthesize_with_speed_search(self,
                                       cur_tokens: np.ndarray,
                                       prosody_wave_24k: np.ndarray,
@@ -426,50 +490,106 @@ class SVR_TTS:
                                       scaling_min: float,
                                       scaling_max: float) -> tuple[np.ndarray, float, float]:
         """
-        Автоподбор скорости под целевую длительность с минимальным числом вызовов _synthesize_base.
+        Автоподбор скорости синтеза, чтобы итоговая длительность получилась “похожей” на семпл.
 
-        Стратегия:
-          - Сразу стартуем с максимальной скорости (обычно нужно ускорять).
-          - Если упёрлись в границу (min/max) и всё равно вне допусков — дальше пытаться бессмысленно.
-          - После первого синтеза оцениваем "базовую длительность": base_sec ≈ out_sec * speed0
-            и прыгаем на speed ≈ base_sec / target_sec.
-          - Далее до N уточнений фиксированным мультипликативным шагом (1 + step_pct).
+        Что считается “похожей”:
+          - Мы заранее считаем допустимый коридор длительности [min_sec .. max_sec].
+          - Этот коридор задаётся параметрами допусков:
+            max_longer_pct_* / max_shorter_pct_* + len_t_short / len_t_long.
+          - Для коротких реплик допуск шире, для длинных уже (меняется плавно).
+
+        Что делает функция:
+          1) Синтезирует аудио с некоторой скоростью (speed).
+          2) Смотрит, сколько секунд получилось на выходе.
+          3) Если выход попадает в допустимый коридор — останавливается.
+          4) Если нет — пробует другую скорость, но ограниченно (чтобы не делать 100 пересинтезов).
+
+        Важно:
+          - speed ограничивается speed_clip_min..speed_clip_max, чтобы не ломать модель.
+          - Функция старается минимизировать число вызовов _synthesize_base.
         """
         target_sec = float(target_sec)
+
+        # Если цель некорректная (0 или меньше), то смысла подбирать скорость нет.
+        # Синтезируем с нормальной скоростью 1.0 и выходим.
         if target_sec <= 0:
             wave = self._synthesize_base(cur_tokens, prosody_wave_24k, 1.0, True, scaling_min, scaling_max)
             return wave, 1.0, 0.0
 
         EPS_S = 1e-6
+
+        # Реальные ограничения скорости (чтобы не улететь в экстремальные значения)
         s_min = float(self.speed_clip_min)
         s_max = float(self.speed_clip_max)
 
-        def rel_err(out_s: float) -> float:
-            return abs(out_s - target_sec) / max(target_sec, EPS)
+        # Считаем допустимые границы по длительности результата (в секундах)
+        # Например: можно быть короче на 10% и длиннее на 20% -> получим [target*0.9 .. target*1.2]
+        # Причём проценты зависят от длины реплики (короткие/длинные).
+        low_s, high_s = self._length_bounds(target_sec)
+
+        def in_bounds(out_s: float) -> bool:
+            """Проверка: попали ли мы в разрешённый коридор длительности."""
+            return low_s <= out_s <= high_s
+
+        def err_ratio(out_s: float) -> float:
+            """
+            “Насколько плохо мы попали” (для выбора лучшего результата).
+            - Если попали в коридор: ошибка = 0
+            - Если короче минимума: считаем, насколько не дотянули до low_s
+            - Если длиннее максимума: считаем, насколько перелетели high_s
+            Возвращаем в долях от target_sec (чтобы значения были сопоставимы).
+            """
+            if in_bounds(out_s):
+                return 0.0
+            if out_s < low_s:
+                return (low_s - out_s) / max(target_sec, EPS)
+            return (out_s - high_s) / max(target_sec, EPS)
 
         def unfixable_at_bound(speed: float, out_s: float) -> bool:
-            # На max скорости всё ещё слишком длинно => ускорять уже нельзя
-            if speed >= s_max - EPS_S and out_s > target_sec * (1.0 + self.speed_match_tolerance):
+            """
+            Быстрая проверка “дальше бессмысленно”.
+            - Если мы уже на максимальной скорости, но аудио всё равно слишком длинное,
+              то ускорить больше нельзя (значит дальше синтезить бессмысленно).
+            - Если мы уже на минимальной скорости, но аудио всё равно слишком короткое,
+              то замедлить больше нельзя.
+            """
+            if speed >= s_max - EPS_S and out_s > high_s:
                 return True
-            # На min скорости всё ещё слишком коротко => замедлять уже нельзя
-            if speed <= s_min + EPS_S and out_s < target_sec * (1.0 - self.speed_match_tolerance):
+            if speed <= s_min + EPS_S and out_s < low_s:
                 return True
             return False
 
-        # best-результат
+        # Тут будем хранить “самый удачный” вариант из всех попыток.
+        # Даже если не попали в коридор, вернём то, что было ближе всего.
         best_wave: Optional[np.ndarray] = None
         best_speed: float = 1.0
         best_err: float = float("inf")
 
+        # Последняя измеренная длительность (чтобы понимать направление на следующем шаге)
+        last_out_sec: float = 0.0
+
         def synth_eval(speed: float) -> tuple[np.ndarray, float, float]:
-            """Синтез + расчёт out_sec/err + обновление best."""
-            nonlocal best_wave, best_speed, best_err
+            """
+            Один шаг: синтезировать с speed, измерить длительность, обновить “best”.
+            """
+            nonlocal best_wave, best_speed, best_err, last_out_sec
+
+            # Подстраховка: скорость всегда держим в разумном диапазоне
             speed = self._clip_speed(float(speed))
 
-            wave_24k = self._synthesize_base(cur_tokens, prosody_wave_24k, speed, True, scaling_min, scaling_max)
-            out_sec = float(wave_24k.shape[-1]) / float(INPUT_SR)
-            err = rel_err(out_sec)
+            # Синтез с заданной скоростью
+            wave_24k = self._synthesize_base(
+                cur_tokens, prosody_wave_24k, speed, True, scaling_min, scaling_max
+            )
 
+            # Переводим длину массива в секунды
+            out_sec = float(wave_24k.shape[-1]) / float(INPUT_SR)
+            last_out_sec = out_sec
+
+            # Считаем ошибку относительно коридора
+            err = err_ratio(out_sec)
+
+            # Обновляем лучший результат, если стали ближе к цели
             if err < best_err:
                 best_err = err
                 best_speed = speed
@@ -477,30 +597,46 @@ class SVR_TTS:
 
             return wave_24k, out_sec, err
 
-        # 1) Старт: максимальная скорость
+        # -------------------------
+        # Шаг 1. Стартуем с максимальной скорости
+        # -------------------------
+        # Почему так: чаще всего TTS даёт чуть растянутую речь, и ускорение помогает попасть быстрее.
         speed = self._clip_speed(s_max)
-        wave_24k, out_sec, err = synth_eval(speed)
+        _, out_sec, err = synth_eval(speed)
 
-        if err <= self.speed_match_tolerance:
+        # Если уже попали в коридор — всё, можно заканчивать.
+        if err <= 0.0:
             return best_wave, best_speed, best_err
 
+        # Если мы упёрлись в границу скорости и всё равно не попали — смысла дальше нет.
         if unfixable_at_bound(speed, out_sec):
             return best_wave, best_speed, best_err
 
-        # 2) Прыжок на предсказанную скорость: base_sec ≈ out_sec * speed
+        # -------------------------
+        # Шаг 2. “Умный прыжок” к более подходящей скорости
+        # -------------------------
+        # Идея: грубо оцениваем “какой была бы длительность при speed=1.0”.
+        # Если при speed=speed мы получили out_sec, то при speed=1.0 было бы примерно out_sec * speed.
+        # Дальше выбираем скорость, которая приблизит нас к target_sec.
         base_sec_est = out_sec * speed
         speed_pred = self._clip_speed(base_sec_est / max(target_sec, EPS))
 
+        # Чтобы не тратить попытку на то же самое значение, проверяем что speed реально изменился
         if abs(speed_pred - best_speed) > EPS_S:
-            wave_24k, out_sec, err = synth_eval(speed_pred)
+            _, out_sec, err = synth_eval(speed_pred)
 
-            if err <= self.speed_match_tolerance:
+            if err <= 0.0:
                 return best_wave, best_speed, best_err
 
             if unfixable_at_bound(best_speed, out_sec):
                 return best_wave, best_speed, best_err
 
-        # 3) Уточнение шагом (1 + step_pct)
+        # -------------------------
+        # Шаг 3. Небольшие уточнения маленькими шагами
+        # -------------------------
+        # Делаем несколько попыток (speed_search_attempts), двигаясь в правильную сторону:
+        # - если результат слишком длинный -> увеличиваем speed (ускоряем синтез)
+        # - если слишком короткий -> уменьшаем speed (замедляем синтез)
         step = float(self.speed_adjust_step_pct)
         if step <= 0.0 or self.speed_search_attempts <= 0:
             return best_wave, best_speed, best_err
@@ -508,32 +644,40 @@ class SVR_TTS:
         mult = 1.0 + step
 
         for _ in range(self.speed_search_attempts):
-            # Направление по последнему измерению out_sec:
-            # длиннее цели -> ускоряем; короче -> замедляем
-            if out_sec > target_sec:
+            # Если уже попали в коридор — стоп.
+            if in_bounds(last_out_sec):
+                break
+
+            # Выбираем направление.
+            # Важно: сравниваем с границами коридора, а не строго с target_sec.
+            if last_out_sec > high_s:
+                # Слишком длинно -> надо ускорять
                 if best_speed >= s_max - EPS_S:
                     break
                 next_speed = best_speed * mult
             else:
+                # Слишком коротко -> надо замедлять
                 if best_speed <= s_min + EPS_S:
                     break
                 next_speed = best_speed / mult
 
             next_speed = self._clip_speed(next_speed)
 
-            # Если следующий шаг упирается в границу и ситуация "неисправима" — можно прекращать
-            if unfixable_at_bound(next_speed, out_sec):
+            # Если следующий шаг упрётся в границу и мы всё равно вне коридора — дальше бессмысленно.
+            if unfixable_at_bound(next_speed, last_out_sec):
                 break
 
-            wave_24k, out_sec, err = synth_eval(next_speed)
+            _, out_sec, err = synth_eval(next_speed)
 
-            if err <= self.speed_match_tolerance:
+            # Если попали — отлично, дальше не надо.
+            if err <= 0.0:
                 break
 
-            # Если после синтеза выяснилось, что мы в "неисправимой" зоне на границе — прекращаем
+            # Если выяснили, что мы уже в “неисправимой” зоне — выходим.
             if unfixable_at_bound(best_speed, out_sec):
                 break
 
+        # Возвращаем лучший найденный вариант (даже если не попали идеально)
         return best_wave, best_speed, best_err
 
     def synthesize_batch(self, inputs: List[SynthesisInput],
