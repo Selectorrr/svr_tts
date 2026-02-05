@@ -122,7 +122,8 @@ class SVR_TTS:
                 max_shorter_pct_short: float = 0.25,
                 max_shorter_pct_long: float = 0.10,
 
-                vc_func: VcFn = None) -> None:
+                vc_func: VcFn = None,
+                put_yo: bool = True) -> None:
         """
         reinit_every — после какого количества обработанных current_input
         переинициализировать onnx-сессии.
@@ -187,6 +188,8 @@ class SVR_TTS:
 
         self.max_shorter_pct_short = float(max_shorter_pct_short)
         self.max_shorter_pct_long = float(max_shorter_pct_long)
+
+        self.put_yo = put_yo
 
 
     def _init_sessions(self) -> None:
@@ -702,7 +705,7 @@ class SVR_TTS:
         """
         synthesized_audios: List[Optional[np.ndarray]] = []
         items = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
-        tokenize_req = {"items": items, "exclusions": stress_exclusions}
+        tokenize_req = {"items": items, "exclusions": stress_exclusions, "put_yo": self.put_yo}
         tokenize_resp = self._tokenize(tokenize_req)
         tokens = tokenize_resp.get('tokens') or []
         # Обработка каждого элемента входных данных
