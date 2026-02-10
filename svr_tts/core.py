@@ -318,13 +318,45 @@ class SVR_TTS:
         # HF
         return self._download(key, cache_dir)
 
+    def _find_in_cache(self, key: str, cache_dir: str) -> str | None:
+        cache_root = Path(cache_dir)
+        if not cache_root.exists():
+            return None
+
+        # Ищем файлы, в названии которых встречается key (можешь ужесточить маску под свои имена)
+        candidates = []
+        candidates += list(cache_root.rglob(f"*{key}*"))
+        # отфильтруем директории
+        candidates = [p for p in candidates if p.is_file()]
+
+        if not candidates:
+            return None
+
+        # если вариантов несколько — выбираем “лучший” твоей же логикой
+        # (можно передавать имена файлов, как в HF)
+        best_name = self._pick_best_name(key, [p.name for p in candidates])
+        if best_name:
+            for p in candidates:
+                if p.name == best_name:
+                    return str(p)
+
+        # иначе просто первый
+        return str(candidates[0])
+
     def _download(self, key: str, cache_dir: str) -> str:
+        cached = self._find_in_cache(key, cache_dir)
+        if cached:
+            return cached
+
+        # В HF ходим только если в кеше не нашли
         files = HfApi().list_repo_files(self.REPO_ID)
         best = self._pick_best_name(key, files)
         if not best:
-            raise FileNotFoundError(f"Не нашли модель '{key}' ни локально, ни в HF репозитории {self.REPO_ID}.")
-        path = hf_hub_download(repo_id=self.REPO_ID, filename=best, cache_dir=cache_dir)
-        return path
+            raise FileNotFoundError(
+                f"Не нашли модель '{key}' ни локально, ни в HF репозитории {self.REPO_ID}."
+            )
+
+        return hf_hub_download(repo_id=self.REPO_ID, filename=best, cache_dir=cache_dir)
 
     def _tokenize(self, token_inputs) -> dict:
         """
