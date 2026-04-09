@@ -18,7 +18,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='svr_tts',
-    version='0.12.1',
+    version='0.12.2',
     packages=find_packages(),
     install_requires=[
         'onnxruntime-gpu',

@@ -75,6 +75,11 @@ VcFn = Callable[
     NDArray[np.float32],
 ]
 
+PostprocessFn = Callable[
+    [NDArray[np.float32], SynthesisInput],
+    NDArray[np.float32],
+]
+
 
 class SVR_TTS:
     """
@@ -123,6 +128,7 @@ class SVR_TTS:
                 max_shorter_pct_long: float = 0.10,
 
                 vc_func: VcFn = None,
+                postprocess_func: PostprocessFn = None,
                 put_yo: bool = True) -> None:
         """
         reinit_every — после какого количества обработанных current_input
@@ -137,6 +143,7 @@ class SVR_TTS:
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.vc_func = vc_func
+        self.postprocess_func = postprocess_func
         self._providers = providers
         self._provider_options = provider_options
         self._session_options = session_options
@@ -839,12 +846,14 @@ class SVR_TTS:
                             prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
 
                     # Объединяем все сегменты в одно аудио
-                    synthesized_audios.append(np.concatenate(generated_chunks))
+                    wave_24k = np.concatenate(generated_chunks)
                 elif self.vc_func:
                     wave_24k = self.vc_func(wave_24k, current_input.timbre_wave_24k, current_input.prosody_wave_24k)
-                    synthesized_audios.append(wave_24k)
-                else:
-                    synthesized_audios.append(wave_24k)
+
+                if self.postprocess_func:
+                    wave_24k = self.postprocess_func(wave_24k, current_input)
+
+                synthesized_audios.append(wave_24k)
 
                 self._maybe_reinit_sessions()
             except Exception as e:
