@@ -106,6 +106,7 @@ class SVR_TTS:
                  dur_high_t1=30.0,
                  dur_high_k=15.0,
                  cps_min=14.0,
+                 timbre_cond: float = 0.3,
                  prosody_cond: float = 0.6,
                  max_text_len: int = 150,
                  vc_type: str = 'native_bigvgan',
@@ -170,6 +171,7 @@ class SVR_TTS:
 
         self._timbre_cache_dir = Path(os.path.join(timbre_cache_dir, "timbre_cache"))
         self._timbre_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.timbre_cond = timbre_cond
         self.prosody_cond = prosody_cond
         self.max_text_len = max_text_len
 
@@ -471,6 +473,7 @@ class SVR_TTS:
 
     def _synthesize_base(self,
                          cur_tokens: np.ndarray,
+                         timbre_wave_24k: np.ndarray,
                          prosody_wave_24k: np.ndarray,
                          duration_or_speed: float,
                          is_speed: bool,
@@ -479,11 +482,13 @@ class SVR_TTS:
         wave_24k, _ = self.base_model.run(
             ["wave_24k", "duration"], {
                 "input_ids": np.expand_dims(cur_tokens, 0),
+                "timbre_wave_24k": timbre_wave_24k,
                 "prosody_wave_24k": prosody_wave_24k,
                 "duration_or_speed": np.array([duration_or_speed], dtype=np.float32),
                 "is_speed": np.array([is_speed], dtype=bool),
                 "scaling_min": np.array([scaling_min], dtype=np.float32),
                 "scaling_max": np.array([scaling_max], dtype=np.float32),
+                "timbre_cond": np.array([self.timbre_cond], dtype=np.float32),
                 "prosody_cond": np.array([self.prosody_cond], dtype=np.float32)
             })
         return wave_24k
@@ -527,6 +532,7 @@ class SVR_TTS:
 
     def _synthesize_with_speed_search(self,
                                       cur_tokens: np.ndarray,
+                                      timbre_wave_24k: np.ndarray,
                                       prosody_wave_24k: np.ndarray,
                                       target_sec: float,
                                       scaling_min: float,
@@ -555,7 +561,7 @@ class SVR_TTS:
         # Если цель некорректная (0 или меньше), то смысла подбирать скорость нет.
         # Синтезируем с нормальной скоростью 1.0 и выходим.
         if target_sec <= 0:
-            wave = self._synthesize_base(cur_tokens, prosody_wave_24k, 1.0, True, scaling_min, scaling_max)
+            wave = self._synthesize_base(cur_tokens, timbre_wave_24k, prosody_wave_24k, 1.0, True, scaling_min, scaling_max)
             return wave, 1.0, 0.0
 
         EPS_S = 1e-6
@@ -621,7 +627,7 @@ class SVR_TTS:
 
             # Синтез с заданной скоростью
             wave_24k = self._synthesize_base(
-                cur_tokens, prosody_wave_24k, speed, True, scaling_min, scaling_max
+                cur_tokens, timbre_wave_24k, prosody_wave_24k, speed, True, scaling_min, scaling_max
             )
 
             # Переводим длину массива в секунды
@@ -785,6 +791,7 @@ class SVR_TTS:
                 else:
                     wave_24k, best_speed, best_err = self._synthesize_with_speed_search(
                         cur_tokens,
+                        timbre_wave,
                         prosody_wave_24k,
                         target_sec,
                         scaling_min,
