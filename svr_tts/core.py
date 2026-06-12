@@ -65,26 +65,48 @@ PostprocessFn = Callable[
 def _prefetch_generator(generator, buffer_size=1):
     q = queue.Queue(maxsize=buffer_size)
     sentinel = object()
+    stop_event = threading.Event()
 
     def worker():
         try:
             for item in generator:
-                q.put(item)
+                if stop_event.is_set():
+                    break
+                while not stop_event.is_set():
+                    try:
+                        q.put(item, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
         except Exception as e:
-            q.put(e)
+            try:
+                q.put(e, timeout=0.5)
+            except queue.Full:
+                pass
         finally:
-            q.put(sentinel)
+            try:
+                q.put(sentinel, timeout=0.5)
+            except queue.Full:
+                pass
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
-    while True:
-        item = q.get()
-        if item is sentinel:
-            break
-        if isinstance(item, Exception):
-            raise item
-        yield item
+    try:
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stop_event.set()
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
 
 
 class SVR_TTS:
@@ -624,6 +646,74 @@ class SVR_TTS:
 
             yield (wave_24k, current_input, timbre_wave, prosody_wave, prosody_wave_24k)
 
+    def _generate_voice_conversion(self, buffered_base_generator):
+        """
+        Генератор конверсии голоса (вторая стадия конвейера).
+        Выполняется в отдельном фоновом потоке.
+        """
+        for base_result in buffered_base_generator:
+            try:
+                if base_result is None:
+                    yield None
+                    continue
+
+                wave_24k, current_input, timbre_wave, prosody_wave, prosody_wave_24k = base_result
+                wave_24k_orig = wave_24k.copy()
+
+                if not self.vc_func and self.vc_type:
+                    min_len = min(len(timbre_wave), len(prosody_wave))
+                    timbre_wave_concat = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
+                    speaker_style = self.compute_style(timbre_wave_concat)
+
+                    cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
+                        self.encoder_model.run(
+                            ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
+                             "prompt_length"], {
+                                "wave_24k": wave_24k,
+                                "semantic_wave": self.compute_semantic(wave_24k),
+                                "prosody_wave": timbre_wave_concat,
+                                "semantic_timbre": self.compute_semantic(timbre_wave_concat)
+                            }))
+
+                    generated_chunks: List[np.ndarray] = []
+                    prev_overlap_chunk: Optional[np.ndarray] = None
+
+                    for seg_idx, seg_length in enumerate(data_lengths):
+                        segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
+                                                                latent_features[seg_idx],
+                                                                time_span,
+                                                                int(seg_length),
+                                                                prompt_features[seg_idx],
+                                                                speaker_style,
+                                                                prompt_length)
+                        if seg_idx == 0:
+                            mute_fade(segment_wave, self.OUTPUT_SR)
+                            chunk = segment_wave[:-OVERLAP_LENGTH]
+                            generated_chunks.append(chunk)
+                            prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+                        elif seg_idx == len(data_lengths) - 1:
+                            chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
+                            generated_chunks.append(chunk)
+                            break
+                        else:
+                            chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
+                            generated_chunks.append(chunk)
+                            prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+
+                    wave_24k = np.concatenate(generated_chunks)
+                elif self.vc_func:
+                    wave_24k = self.vc_func(wave_24k, current_input.timbre_wave_24k, current_input.prosody_wave_24k)
+
+                if self.postprocess_func:
+                    wave_24k = self.postprocess_func(wave_24k, current_input, wave_24k_orig)
+
+                yield wave_24k
+
+            except Exception as e:
+                traceback.print_exc()
+                yield None
+                continue
+
     def synthesize_batch(self, inputs: List[SynthesisInput],
                          stress_exclusions: Dict[str, Any] = {},
                          duration_or_speed: float = None,
@@ -631,7 +721,7 @@ class SVR_TTS:
                          scaling_min: float = float('-inf'),
                          scaling_max: float = float('inf'), tqdm_kwargs: Dict[str, Any] = None) -> Generator[Optional[np.ndarray], None, None]:
         """
-        Синтезирует аудио для каждого элемента входного списка с использованием конвейера (pipelining).
+        Синтезирует аудио для каждого элемента входного списка с использованием двухстадийного конвейера (Double Prefetching).
         """
         items = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_req = {"items": items, "exclusions": stress_exclusions, "put_yo": self.put_yo}
@@ -639,78 +729,20 @@ class SVR_TTS:
         tokens = tokenize_resp.get('tokens') or []
         tqdm_kwargs = tqdm_kwargs or {}
 
-        # 1. Запускаем генератор базовых волн
+        # 1. Первая стадия: Генератор базовых волн
         base_generator = self._generate_base_waves(
             inputs, tokens, duration_or_speed, is_speed, scaling_min, scaling_max, tqdm_kwargs
         )
-
-        # 2. Оборачиваем его в prefetch_generator, чтобы базовая модель считала наперед в фоновом потоке!
         buffered_base_generator = _prefetch_generator(base_generator, buffer_size=1)
 
-        # 3. Основной цикл конверсии голоса (выполняется в основном потоке)
+        # 2. Вторая стадия: Генератор конверсии голоса (диффузия, кодирование, вокодер)
+        vc_generator = self._generate_voice_conversion(buffered_base_generator)
+        buffered_vc_generator = _prefetch_generator(vc_generator, buffer_size=1)
+
+        # 3. Основной поток: Только возвращает готовые результаты, не блокируясь на вычислениях
         try:
-            for base_result in buffered_base_generator:
-                try:
-                    if base_result is None:
-                        yield None
-                        continue
-
-                    wave_24k, current_input, timbre_wave, prosody_wave, prosody_wave_24k = base_result
-                    wave_24k_orig = wave_24k.copy()
-
-                    if not self.vc_func and self.vc_type:
-                        min_len = min(len(timbre_wave), len(prosody_wave))
-                        timbre_wave_concat = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
-                        speaker_style = self.compute_style(timbre_wave_concat)
-
-                        cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
-                            self.encoder_model.run(
-                                ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
-                                 "prompt_length"], {
-                                    "wave_24k": wave_24k,
-                                    "semantic_wave": self.compute_semantic(wave_24k),
-                                    "prosody_wave": timbre_wave_concat,
-                                    "semantic_timbre": self.compute_semantic(timbre_wave_concat)
-                                }))
-
-                        generated_chunks: List[np.ndarray] = []
-                        prev_overlap_chunk: Optional[np.ndarray] = None
-
-                        for seg_idx, seg_length in enumerate(data_lengths):
-                            segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
-                                                                    latent_features[seg_idx],
-                                                                    time_span,
-                                                                    int(seg_length),
-                                                                    prompt_features[seg_idx],
-                                                                    speaker_style,
-                                                                    prompt_length)
-                            if seg_idx == 0:
-                                mute_fade(segment_wave, self.OUTPUT_SR)
-                                chunk = segment_wave[:-OVERLAP_LENGTH]
-                                generated_chunks.append(chunk)
-                                prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-                            elif seg_idx == len(data_lengths) - 1:
-                                chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
-                                generated_chunks.append(chunk)
-                                break
-                            else:
-                                chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
-                                generated_chunks.append(chunk)
-                                prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-
-                        wave_24k = np.concatenate(generated_chunks)
-                    elif self.vc_func:
-                        wave_24k = self.vc_func(wave_24k, current_input.timbre_wave_24k, current_input.prosody_wave_24k)
-
-                    if self.postprocess_func:
-                        wave_24k = self.postprocess_func(wave_24k, current_input, wave_24k_orig)
-
-                    yield wave_24k
-
-                except Exception as e:
-                    traceback.print_exc()
-                    yield None
-                    continue
+            for result in buffered_vc_generator:
+                yield result
         finally:
             self._init_sessions()
 
