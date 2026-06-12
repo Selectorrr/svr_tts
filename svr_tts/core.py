@@ -18,6 +18,8 @@ import logging
 import os
 import re
 import traceback
+import queue
+import threading
 from itertools import zip_longest
 from pathlib import Path
 
@@ -29,19 +31,7 @@ from tqdm import tqdm
 
 from svr_tts.utils import split_text, split_audio, _crossfade, prepare_prosody, mute_fade, istft_ola
 
-"""
-Модуль синтеза речи с использованием нескольких моделей ONNX.
-В модуле реализована генерация аудио из входного текста с учетом тембра и просодии.
-Основные компоненты:
-- Токенизация текста с помощью REST-сервиса.
-- Инференс базовой, семантической, кодирующей, оценочной и вокодерной моделей.
-- Обработка сегментов аудио с применением кроссфейда для плавного соединения.
-
-Перед запуском убедитесь, что модели находятся по указанным путям и
-что сервис токенизации доступен.
-"""
-
-from typing import NamedTuple, List, Any, Optional, Sequence, Dict, Callable
+from typing import NamedTuple, List, Any, Optional, Sequence, Dict, Callable, Generator
 import numpy as np
 # noinspection PyPackageRequirements
 import onnxruntime as ort
@@ -55,15 +45,6 @@ INPUT_SR = 24_000
 
 
 class SynthesisInput(NamedTuple):
-    """
-    Структура входных данных для синтеза речи.
-
-    Атрибуты:
-        text: исходный текст для синтеза.
-        stress: флаг, указывающий на использование ударений в тексте.
-        timbre_wave_24k: массив для модели тембра (24kHz).
-        prosody_wave_24k: массив для модели просодии (24kHz).
-    """
     text: str
     stress: bool
     timbre_wave_24k: np.ndarray
@@ -76,21 +57,37 @@ VcFn = Callable[
 ]
 
 PostprocessFn = Callable[
-    [NDArray[np.float32], SynthesisInput],
+    [NDArray[np.float32], SynthesisInput, NDArray[np.float32]],
     NDArray[np.float32],
 ]
 
 
+def _prefetch_generator(generator, buffer_size=1):
+    q = queue.Queue(maxsize=buffer_size)
+    sentinel = object()
+
+    def worker():
+        try:
+            for item in generator:
+                q.put(item)
+        except Exception as e:
+            q.put(e)
+        finally:
+            q.put(sentinel)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
 class SVR_TTS:
-    """
-    Класс для синтеза речи с использованием нескольких ONNX моделей.
-
-    Методы:
-        _tokenize: отправляет запрос к сервису токенизации.
-        _synthesize_segment: генерирует аудио для одного сегмента.
-        synthesize_batch: синтезирует аудио для каждого элемента входных данных.
-    """
-
     REPO_ID = "selectorrrr/svr-tts-large"
 
     def __init__(self, api_key,
@@ -100,7 +97,6 @@ class SVR_TTS:
                  session_options: SessionOptions | None = None,
                  timbre_cache_dir: str = 'workspace/voices/',
                  user_models_dir: str | None = None,
-                 reinit_every: int = 32,
                  dur_norm_low: float = 5.0,
                  dur_high_t0=1.0,
                  dur_high_t1=30.0,
@@ -130,17 +126,8 @@ class SVR_TTS:
 
                 vc_func: VcFn = None,
                 postprocess_func: PostprocessFn = None,
-                put_yo: bool = True) -> None:
-        """
-        reinit_every — после какого количества обработанных current_input
-        переинициализировать onnx-сессии.
-        Если reinit_every <= 0 — реинициализация отключена.
-
-        Пояснение по допускам:
-        - len_t_short / len_t_long задают “короткие” и “длинные” реплики (в секундах).
-        - max_*_pct_short применяются к коротким, max_*_pct_long к длинным.
-        - между ними допуск меняется постепенно.
-        """
+                put_yo: bool = True,
+                device: str = 'cuda') -> None:
         if providers is None:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.vc_func = vc_func
@@ -148,8 +135,6 @@ class SVR_TTS:
         self._providers = providers
         self._provider_options = provider_options
         self._session_options = session_options
-        self._reinit_every = int(reinit_every)
-        self._processed_since_reinit = 0
         self.dur_norm_low = dur_norm_low
         self.dur_high_t0 = dur_high_t0
         self.dur_high_t1 = dur_high_t1
@@ -199,7 +184,7 @@ class SVR_TTS:
         self.max_shorter_pct_long = float(max_shorter_pct_long)
 
         self.put_yo = put_yo
-
+        self.device = device
 
     def _init_sessions(self) -> None:
         cache_dir = self._cache_dir
@@ -259,34 +244,13 @@ class SVR_TTS:
                     sess_options=self._session_options,
                 )
 
-
-    def _maybe_reinit_sessions(self) -> None:
-        """
-        Увеличивает счётчик обработанных элементов и при необходимости
-        реинициализирует onnx-сессии.
-        Если self._reinit_every <= 0 — ничего не делает.
-        """
-        if self._reinit_every <= 0:
-            return
-
-        self._processed_since_reinit += 1
-        if self._processed_since_reinit >= self._reinit_every:
-            self._init_sessions()
-            self._processed_since_reinit = 0
-
     def _get_cache_dir(self) -> str:
         cache_dir = user_cache_dir("svr_tts", "SynthVoiceRu")
         os.makedirs(cache_dir, exist_ok=True)
         return cache_dir
 
-    # ----- единый селектор имени -----
     @staticmethod
     def _pick_best_name(key: str, names: list[str]) -> str | None:
-        """
-        Выбираем *.onnx, чьё имя содержит key:
-        - максимальная версия по суффиксу _vN (если нет — v0)
-        - при равенстве версии берём более длинное имя
-        """
         key_l = key.lower()
         best_ver = -1
         best_len = -1
@@ -307,14 +271,6 @@ class SVR_TTS:
         return best_name
 
     def _resolve(self, key: str, cache_dir: str) -> str:
-        """
-        1) user_models_dir: ищем *.onnx по key с выбором версии (_vN).
-        2) HF: тот же отбор версий среди файлов репозитория.
-        Если нигде не нашли — FileNotFoundError.
-        """
-        logger = logging.getLogger("SVR_TTS")
-
-        # локальные кандидаты
         if self._user_models_dir:
             local_names = [p.name for p in self._user_models_dir.glob("*.onnx")]
             best_local = self._pick_best_name(key, local_names)
@@ -323,8 +279,6 @@ class SVR_TTS:
                 if lp.is_file():
                     resolved = str(lp.resolve())
                     return resolved
-
-        # HF
         return self._download(key, cache_dir)
 
     def _find_in_cache(self, key: str, cache_dir: str) -> str | None:
@@ -332,24 +286,18 @@ class SVR_TTS:
         if not cache_root.exists():
             return None
 
-        # Ищем файлы, в названии которых встречается key (можешь ужесточить маску под свои имена)
         candidates = []
         candidates += list(cache_root.rglob(f"*{key}*"))
-        # отфильтруем директории
         candidates = [p for p in candidates if p.is_file()]
 
         if not candidates:
             return None
 
-        # если вариантов несколько — выбираем “лучший” твоей же логикой
-        # (можно передавать имена файлов, как в HF)
         best_name = self._pick_best_name(key, [p.name for p in candidates])
         if best_name:
             for p in candidates:
                 if p.name == best_name:
                     return str(p)
-
-        # иначе просто первый
         return str(candidates[0])
 
     def _download(self, key: str, cache_dir: str) -> str:
@@ -357,34 +305,19 @@ class SVR_TTS:
         if cached:
             return cached
 
-        # В HF ходим только если в кеше не нашли
         files = HfApi().list_repo_files(self.REPO_ID)
         best = self._pick_best_name(key, files)
         if not best:
             raise FileNotFoundError(
                 f"Не нашли модель '{key}' ни локально, ни в HF репозитории {self.REPO_ID}."
             )
-
         return hf_hub_download(repo_id=self.REPO_ID, filename=best, cache_dir=cache_dir)
 
     def _tokenize(self, token_inputs) -> dict:
-        """
-        Отправляет данные для токенизации к REST-сервису и возвращает результат.
-
-        Аргументы:
-            token_inputs: список словарей с данными текста и флагом ударений.
-
-        Возвращает:
-            Массив токенов, полученных от сервиса.
-
-        Генерирует:
-            AssertionError, если HTTP статус запроса не 200.
-        """
         headers = {
             "Content-Type": "application/json",
             "api-key": self.api_key
         }
-
         response = requests.post(self.tokenizer_service_url, json=token_inputs, headers=headers)
         if response.status_code != 200:
             try:
@@ -397,45 +330,70 @@ class SVR_TTS:
     def _synthesize_segment(self, cat_conditions: np.ndarray, latent_features: np.ndarray,
                             time_span: List[float], data_length: int, prompt_features: np.ndarray,
                             speaker_style: Any, prompt_length: int) -> np.ndarray:
-        """
-        Генерирует аудио для одного сегмента после кодирования.
-
-        Аргументы:
-            cat_conditions: категориальные условия для сегмента.
-            latent_features: начальные латентные признаки для сегмента.
-            t_span: временные метки для оценки.
-            data_length: реальная длина сегмента для обработки.
-            prompt_features: признаки подсказки для сегмента.
-            speaker_style: стиль дикции, переданный из кодировщика.
-            prompt_length: длина подсказки.
-
-        Возвращает:
-            Сегмент аудио в виде numpy-массива.
-        """
-        # Подготовка входных данных для инференса сегмента
         encoded_input = np.expand_dims(cat_conditions[:data_length, :], axis=0)
         latent_input = np.expand_dims(np.transpose(latent_features[:data_length, :], (1, 0)), axis=0)
         prompt_input = np.expand_dims(np.transpose(prompt_features[:data_length, :], (1, 0)), axis=0)
         seg_length_arr = np.array([data_length], dtype=np.int32)
+        time_span_np = np.array(time_span, dtype=np.float32)
 
-        # Итеративно запускаем оценочную модель
+        if not isinstance(prompt_length, np.ndarray):
+            prompt_length_np = np.array(prompt_length, dtype=np.int64)
+        else:
+            prompt_length_np = prompt_length
+
+        dev = self.device
+        dev_id = 0
+        if self._provider_options:
+            for opt in self._provider_options:
+                if isinstance(opt, dict) and "device_id" in opt:
+                    try:
+                        dev_id = int(opt["device_id"])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        encoded_ort = ort.OrtValue.ortvalue_from_numpy(encoded_input, dev, dev_id)
+        prompt_ort = ort.OrtValue.ortvalue_from_numpy(prompt_input, dev, dev_id)
+        style_ort = ort.OrtValue.ortvalue_from_numpy(speaker_style, dev, dev_id)
+        seg_len_ort = ort.OrtValue.ortvalue_from_numpy(seg_length_arr, dev, dev_id)
+        time_span_ort = ort.OrtValue.ortvalue_from_numpy(time_span_np, dev, dev_id)
+        prompt_length_ort = ort.OrtValue.ortvalue_from_numpy(prompt_length_np, dev, dev_id)
+        latent_ort = ort.OrtValue.ortvalue_from_numpy(latent_input, dev, dev_id)
+
+        io_binding = self.estimator_model.io_binding()
+        io_binding.bind_ortvalue_input("encoded_input", encoded_ort)
+        io_binding.bind_ortvalue_input("prompt_input", prompt_ort)
+        io_binding.bind_ortvalue_input("speaker_style", style_ort)
+        io_binding.bind_ortvalue_input("time_span", time_span_ort)
+        io_binding.bind_ortvalue_input("seg_length_arr", seg_len_ort)
+        io_binding.bind_ortvalue_input("prompt_length", prompt_length_ort)
+
         for step in range(1, len(time_span)):
-            current_time = np.array(time_span[step - 1], dtype=np.float32)
-            current_step = np.array(step, dtype=np.int32)
-            latent_input, current_time = self.estimator_model.run(["latent_output", "current_time_output"], {
-                "encoded_input": encoded_input,
-                "prompt_input": prompt_input,
-                "current_step": current_step,
-                "speaker_style": speaker_style,
-                "current_time_input": current_time,
-                "time_span": np.array(time_span, dtype=np.float32),
-                "seg_length_arr": seg_length_arr,
-                "latent_input": latent_input,
-                "prompt_length": prompt_length,
-            })
+            current_time_np = np.array(time_span_np[step - 1], dtype=np.float32)
+            current_time_ort = ort.OrtValue.ortvalue_from_numpy(current_time_np, dev, dev_id)
 
-        # Генерация аудио через вокодер
-        latent_input = latent_input[:, :, prompt_length:]
+            current_step_np = np.array(step, dtype=np.int32)
+            current_step_ort = ort.OrtValue.ortvalue_from_numpy(current_step_np, dev, dev_id)
+
+            io_binding.bind_ortvalue_input("current_step", current_step_ort)
+            io_binding.bind_ortvalue_input("current_time_input", current_time_ort)
+            io_binding.bind_ortvalue_input("latent_input", latent_ort)
+
+            io_binding.bind_output("latent_output", dev, dev_id)
+            io_binding.bind_output("current_time_output", dev, dev_id)
+
+            self.estimator_model.run_with_iobinding(io_binding)
+
+            outputs = io_binding.get_outputs()
+            latent_ort = outputs[0]
+
+        latent_input = latent_ort.numpy()
+
+        if isinstance(prompt_length, np.ndarray):
+            p_len = int(prompt_length.item())
+        else:
+            p_len = int(prompt_length)
+        latent_input = latent_input[:, :, p_len:]
         if self.vc_type == 'native_bigvgan':
             wave_22050 = self.vocoder_model.run(["wave_22050"], {
                 "latent_input": latent_input
@@ -464,7 +422,6 @@ class SVR_TTS:
         return semantic
 
     def _clip_speed(self, speed: float) -> float:
-        # Clip speed into a sane range to avoid model instability
         if speed < self.speed_clip_min:
             return self.speed_clip_min
         if speed > self.speed_clip_max:
@@ -498,7 +455,6 @@ class SVR_TTS:
         return a + (b - a) * k
 
     def _interp_by_len(self, t_sec: float, short_val: float, long_val: float) -> float:
-        """Плавно меняем значение от short_val (короткие) к long_val (длинные)."""
         t0 = self.len_t_short
         t1 = self.len_t_long
         if t1 <= t0 + 1e-9:
@@ -511,24 +467,16 @@ class SVR_TTS:
         return float(self._lerp(short_val, long_val, k))
 
     def _length_allowances(self, target_sec: float) -> tuple[float, float]:
-        """
-        Возвращает (allow_longer, allow_shorter) в долях:
-        allow_longer=0.15 значит можно до +15%,
-        allow_shorter=0.10 значит можно до -10%.
-        """
         t = float(target_sec)
         allow_longer = self._interp_by_len(t, self.max_longer_pct_short, self.max_longer_pct_long)
         allow_shorter = self._interp_by_len(t, self.max_shorter_pct_short, self.max_shorter_pct_long)
-        # на всякий случай
         return max(0.0, allow_longer), max(0.0, allow_shorter)
 
     def _length_bounds(self, target_sec: float) -> tuple[float, float]:
-        """Нижняя/верхняя граница длительности результата (в секундах)."""
         allow_longer, allow_shorter = self._length_allowances(target_sec)
         low = float(target_sec) * (1.0 - allow_shorter)
         high = float(target_sec) * (1.0 + allow_longer)
         return low, high
-
 
     def _synthesize_with_speed_search(self,
                                       cur_tokens: np.ndarray,
@@ -537,56 +485,20 @@ class SVR_TTS:
                                       target_sec: float,
                                       scaling_min: float,
                                       scaling_max: float) -> tuple[np.ndarray, float, float]:
-        """
-        Автоподбор скорости синтеза, чтобы итоговая длительность получилась “похожей” на семпл.
-
-        Что считается “похожей”:
-          - Мы заранее считаем допустимый коридор длительности [min_sec .. max_sec].
-          - Этот коридор задаётся параметрами допусков:
-            max_longer_pct_* / max_shorter_pct_* + len_t_short / len_t_long.
-          - Для коротких реплик допуск шире, для длинных уже (меняется плавно).
-
-        Что делает функция:
-          1) Синтезирует аудио с некоторой скоростью (speed).
-          2) Смотрит, сколько секунд получилось на выходе.
-          3) Если выход попадает в допустимый коридор — останавливается.
-          4) Если нет — пробует другую скорость, но ограниченно (чтобы не делать 100 пересинтезов).
-
-        Важно:
-          - speed ограничивается speed_clip_min..speed_clip_max, чтобы не ломать модель.
-          - Функция старается минимизировать число вызовов _synthesize_base.
-        """
         target_sec = float(target_sec)
-
-        # Если цель некорректная (0 или меньше), то смысла подбирать скорость нет.
-        # Синтезируем с нормальной скоростью 1.0 и выходим.
         if target_sec <= 0:
             wave = self._synthesize_base(cur_tokens, timbre_wave_24k, prosody_wave_24k, 1.0, True, scaling_min, scaling_max)
             return wave, 1.0, 0.0
 
         EPS_S = 1e-6
-
-        # Реальные ограничения скорости (чтобы не улететь в экстремальные значения)
         s_min = float(self.speed_clip_min)
         s_max = float(self.speed_clip_max)
-
-        # Считаем допустимые границы по длительности результата (в секундах)
-        # Например: можно быть короче на 10% и длиннее на 20% -> получим [target*0.9 .. target*1.2]
-        # Причём проценты зависят от длины реплики (короткие/длинные).
         low_s, high_s = self._length_bounds(target_sec)
 
         def in_bounds(out_s: float) -> bool:
-            """Проверка: попали ли мы в разрешённый коридор длительности."""
             return low_s <= out_s <= high_s
 
         def err_ratio(out_s: float) -> float:
-            """
-            “Насколько плохо мы попали” (для выбора лучшего результата).
-            - Если попали в коридор: ошибка = 0
-            - Если короче минимума: считаем, насколько не дотянули до low_s
-            - Если длиннее максимума: считаем, насколько перелетели high_s
-            Возвращаем в долях от target_sec (чтобы значения были сопоставимы).
-            """
             if in_bounds(out_s):
                 return 0.0
             if out_s < low_s:
@@ -594,282 +506,213 @@ class SVR_TTS:
             return (out_s - high_s) / max(target_sec, EPS)
 
         def unfixable_at_bound(speed: float, out_s: float) -> bool:
-            """
-            Быстрая проверка “дальше бессмысленно”.
-            - Если мы уже на максимальной скорости, но аудио всё равно слишком длинное,
-              то ускорить больше нельзя (значит дальше синтезить бессмысленно).
-            - Если мы уже на минимальной скорости, но аудио всё равно слишком короткое,
-              то замедлить больше нельзя.
-            """
             if speed >= s_max - EPS_S and out_s > high_s:
                 return True
             if speed <= s_min + EPS_S and out_s < low_s:
                 return True
             return False
 
-        # Тут будем хранить “самый удачный” вариант из всех попыток.
-        # Даже если не попали в коридор, вернём то, что было ближе всего.
         best_wave: Optional[np.ndarray] = None
         best_speed: float = 1.0
         best_err: float = float("inf")
-
-        # Последняя измеренная длительность (чтобы понимать направление на следующем шаге)
         last_out_sec: float = 0.0
 
         def synth_eval(speed: float) -> tuple[np.ndarray, float, float]:
-            """
-            Один шаг: синтезировать с speed, измерить длительность, обновить “best”.
-            """
             nonlocal best_wave, best_speed, best_err, last_out_sec
-
-            # Подстраховка: скорость всегда держим в разумном диапазоне
             speed = self._clip_speed(float(speed))
-
-            # Синтез с заданной скоростью
             wave_24k = self._synthesize_base(
                 cur_tokens, timbre_wave_24k, prosody_wave_24k, speed, True, scaling_min, scaling_max
             )
-
-            # Переводим длину массива в секунды
             out_sec = float(wave_24k.shape[-1]) / float(INPUT_SR)
             last_out_sec = out_sec
-
-            # Считаем ошибку относительно коридора
             err = err_ratio(out_sec)
 
-            # Обновляем лучший результат, если стали ближе к цели
             if err < best_err:
                 best_err = err
                 best_speed = speed
                 best_wave = wave_24k
-
             return wave_24k, out_sec, err
 
-        # -------------------------
-        # Шаг 1. Стартуем с максимальной скорости
-        # -------------------------
-        # Почему так: чаще всего TTS даёт чуть растянутую речь, и ускорение помогает попасть быстрее.
         speed = self._clip_speed(s_max)
         _, out_sec, err = synth_eval(speed)
 
-        # Если уже попали в коридор — всё, можно заканчивать.
         if err <= 0.0:
             return best_wave, best_speed, best_err
-
-        # Если мы упёрлись в границу скорости и всё равно не попали — смысла дальше нет.
         if unfixable_at_bound(speed, out_sec):
             return best_wave, best_speed, best_err
 
-        # -------------------------
-        # Шаг 2. “Умный прыжок” к более подходящей скорости
-        # -------------------------
-        # Идея: грубо оцениваем “какой была бы длительность при speed=1.0”.
-        # Если при speed=speed мы получили out_sec, то при speed=1.0 было бы примерно out_sec * speed.
-        # Дальше выбираем скорость, которая приблизит нас к target_sec.
         base_sec_est = out_sec * speed
         speed_pred = self._clip_speed(base_sec_est / max(target_sec, EPS))
 
-        # Чтобы не тратить попытку на то же самое значение, проверяем что speed реально изменился
         if abs(speed_pred - best_speed) > EPS_S:
             _, out_sec, err = synth_eval(speed_pred)
-
             if err <= 0.0:
                 return best_wave, best_speed, best_err
-
             if unfixable_at_bound(best_speed, out_sec):
                 return best_wave, best_speed, best_err
 
-        # -------------------------
-        # Шаг 3. Небольшие уточнения маленькими шагами
-        # -------------------------
-        # Делаем несколько попыток (speed_search_attempts), двигаясь в правильную сторону:
-        # - если результат слишком длинный -> увеличиваем speed (ускоряем синтез)
-        # - если слишком короткий -> уменьшаем speed (замедляем синтез)
         step = float(self.speed_adjust_step_pct)
         if step <= 0.0 or self.speed_search_attempts <= 0:
             return best_wave, best_speed, best_err
 
         mult = 1.0 + step
-
         for _ in range(self.speed_search_attempts):
-            # Если уже попали в коридор — стоп.
             if in_bounds(last_out_sec):
                 break
-
-            # Выбираем направление.
-            # Важно: сравниваем с границами коридора, а не строго с target_sec.
             if last_out_sec > high_s:
-                # Слишком длинно -> надо ускорять
                 if best_speed >= s_max - EPS_S:
                     break
                 next_speed = best_speed * mult
             else:
-                # Слишком коротко -> надо замедлять
                 if best_speed <= s_min + EPS_S:
                     break
                 next_speed = best_speed / mult
 
             next_speed = self._clip_speed(next_speed)
-
-            # Если следующий шаг упрётся в границу и мы всё равно вне коридора — дальше бессмысленно.
             if unfixable_at_bound(next_speed, last_out_sec):
                 break
 
             _, out_sec, err = synth_eval(next_speed)
-
-            # Если попали — отлично, дальше не надо.
             if err <= 0.0:
                 break
-
-            # Если выяснили, что мы уже в “неисправимой” зоне — выходим.
             if unfixable_at_bound(best_speed, out_sec):
                 break
 
-        # Возвращаем лучший найденный вариант (даже если не попали идеально)
         return best_wave, best_speed, best_err
+
+    def _generate_base_waves(self, inputs, tokens, duration_or_speed, is_speed, scaling_min, scaling_max, tqdm_kwargs):
+        """
+        Генератор базовых волн. Выполняет только синтез базовой модели и поиск скорости.
+        """
+        for current_input, cur_tokens in zip_longest(
+                tqdm(inputs, desc="Базовый синтез (Base Model)", **tqdm_kwargs),
+                tokens,
+                fillvalue=None,
+        ):
+            if not cur_tokens:
+                yield None
+                continue
+
+            timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
+            prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
+
+            target_sec = len(prosody_wave) / float(INPUT_SR)
+            if target_sec < float(self.min_prosody_len):
+                prosody_wave_24k = timbre_wave
+            else:
+                prosody_wave_24k = prosody_wave
+
+            if duration_or_speed is not None:
+                wave_24k = self._synthesize_base(
+                    cur_tokens,
+                    timbre_wave,
+                    prosody_wave_24k,
+                    float(duration_or_speed),
+                    bool(is_speed),
+                    scaling_min,
+                    scaling_max,
+                )
+            else:
+                wave_24k, best_speed, best_err = self._synthesize_with_speed_search(
+                    cur_tokens,
+                    timbre_wave,
+                    prosody_wave_24k,
+                    target_sec,
+                    scaling_min,
+                    scaling_max,
+                )
+
+            yield (wave_24k, current_input, timbre_wave, prosody_wave, prosody_wave_24k)
 
     def synthesize_batch(self, inputs: List[SynthesisInput],
                          stress_exclusions: Dict[str, Any] = {},
                          duration_or_speed: float = None,
                          is_speed: bool = False,
                          scaling_min: float = float('-inf'),
-                         scaling_max: float = float('inf'), tqdm_kwargs: Dict[str, Any] = None) -> List[np.ndarray]:
+                         scaling_max: float = float('inf'), tqdm_kwargs: Dict[str, Any] = None) -> Generator[Optional[np.ndarray], None, None]:
         """
-        Синтезирует аудио для каждого элемента входного списка.
-
-        Аргументы:
-            inputs: список объектов SynthesisInput с данными для синтеза.
-            duration_or_speed: желаемая продолжительность или скорость (если задана).
-            is_speed: True, если задается скорость речи, False если продолжительность.
-            scaling_min: минимальный коэффициент масштабирования.
-            scaling_max: максимальный коэффициент масштабирования.
-            stress_exclusions: слова исключения для расстановки ударений
-
-        Возвращает:
-            Список numpy-массивов, каждый из которых представляет сгенерированное аудио.
+        Синтезирует аудио для каждого элемента входного списка с использованием конвейера (pipelining).
         """
-        synthesized_audios: List[Optional[np.ndarray]] = []
         items = [{"text": inp.text, "stress": inp.stress} for inp in inputs]
         tokenize_req = {"items": items, "exclusions": stress_exclusions, "put_yo": self.put_yo}
         tokenize_resp = self._tokenize(tokenize_req)
         tokens = tokenize_resp.get('tokens') or []
-        # Обработка каждого элемента входных данных
         tqdm_kwargs = tqdm_kwargs or {}
-        for current_input, cur_tokens in zip_longest(
-                tqdm(inputs, desc=tokenize_resp.get('desc', ''), **tqdm_kwargs),
-                tokens,
-                fillvalue=None,
-        ):
-            try:
-                if not cur_tokens:
-                    synthesized_audios.append(None)
-                    self._maybe_reinit_sessions()
+
+        # 1. Запускаем генератор базовых волн
+        base_generator = self._generate_base_waves(
+            inputs, tokens, duration_or_speed, is_speed, scaling_min, scaling_max, tqdm_kwargs
+        )
+
+        # 2. Оборачиваем его в prefetch_generator, чтобы базовая модель считала наперед в фоновом потоке!
+        buffered_base_generator = _prefetch_generator(base_generator, buffer_size=1)
+
+        # 3. Основной цикл конверсии голоса (выполняется в основном потоке)
+        try:
+            for base_result in buffered_base_generator:
+                try:
+                    if base_result is None:
+                        yield None
+                        continue
+
+                    wave_24k, current_input, timbre_wave, prosody_wave, prosody_wave_24k = base_result
+                    wave_24k_orig = wave_24k.copy()
+
+                    if not self.vc_func and self.vc_type:
+                        min_len = min(len(timbre_wave), len(prosody_wave))
+                        timbre_wave_concat = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
+                        speaker_style = self.compute_style(timbre_wave_concat)
+
+                        cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
+                            self.encoder_model.run(
+                                ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
+                                 "prompt_length"], {
+                                    "wave_24k": wave_24k,
+                                    "semantic_wave": self.compute_semantic(wave_24k),
+                                    "prosody_wave": timbre_wave_concat,
+                                    "semantic_timbre": self.compute_semantic(timbre_wave_concat)
+                                }))
+
+                        generated_chunks: List[np.ndarray] = []
+                        prev_overlap_chunk: Optional[np.ndarray] = None
+
+                        for seg_idx, seg_length in enumerate(data_lengths):
+                            segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
+                                                                    latent_features[seg_idx],
+                                                                    time_span,
+                                                                    int(seg_length),
+                                                                    prompt_features[seg_idx],
+                                                                    speaker_style,
+                                                                    prompt_length)
+                            if seg_idx == 0:
+                                mute_fade(segment_wave, self.OUTPUT_SR)
+                                chunk = segment_wave[:-OVERLAP_LENGTH]
+                                generated_chunks.append(chunk)
+                                prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+                            elif seg_idx == len(data_lengths) - 1:
+                                chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
+                                generated_chunks.append(chunk)
+                                break
+                            else:
+                                chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
+                                generated_chunks.append(chunk)
+                                prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
+
+                        wave_24k = np.concatenate(generated_chunks)
+                    elif self.vc_func:
+                        wave_24k = self.vc_func(wave_24k, current_input.timbre_wave_24k, current_input.prosody_wave_24k)
+
+                    if self.postprocess_func:
+                        wave_24k = self.postprocess_func(wave_24k, current_input, wave_24k_orig)
+
+                    yield wave_24k
+
+                except Exception as e:
+                    traceback.print_exc()
+                    yield None
                     continue
-                timbre_wave = current_input.timbre_wave_24k.astype(np.float32)
-                prosody_wave = current_input.prosody_wave_24k.astype(np.float32)
-
-                # Цель по длительности — длительность просодии (в секундах)
-                target_sec = len(prosody_wave) / float(INPUT_SR)
-
-                # Просодия: если слишком короткая — подмешиваем тембр вместо просодии
-                if target_sec < float(self.min_prosody_len):
-                    prosody_wave_24k = timbre_wave
-                else:
-                    prosody_wave_24k = prosody_wave
-
-                # 1) Если duration_or_speed задан — работаем как раньше (внешний контроль)
-                # 2) Иначе — автоподбор скорости: сначала speed=1.0, затем N попыток, ранняя остановка
-                if duration_or_speed is not None:
-                    wave_24k = self._synthesize_base(
-                        cur_tokens,
-                        prosody_wave_24k,
-                        float(duration_or_speed),
-                        bool(is_speed),
-                        scaling_min,
-                        scaling_max,
-                    )
-                else:
-                    wave_24k, best_speed, best_err = self._synthesize_with_speed_search(
-                        cur_tokens,
-                        timbre_wave,
-                        prosody_wave_24k,
-                        target_sec,
-                        scaling_min,
-                        scaling_max,
-                    )
-                    # debug info (не шумим в stdout)
-                    logging.getLogger(__name__).debug(
-                        "Auto speed fit: speed=%.4f err=%.2f%% target=%.3fs out=%.3fs text_len=%d",
-                        best_speed,
-                        best_err * 100.0,
-                        target_sec,
-                        wave_24k.shape[-1] / float(INPUT_SR),
-                        len(current_input.text),
-                    )
-
-                if not self.vc_func and self.vc_type:
-                    min_len = min(len(timbre_wave), len(prosody_wave))
-                    timbre_wave = np.concatenate((timbre_wave[:min_len], prosody_wave[:min_len]))
-                    speaker_style = self.compute_style(timbre_wave)
-
-                    # Получаем условия для дальнейшего кодирования и генерации
-                    cat_conditions, latent_features, time_span, data_lengths, prompt_features, prompt_length = (
-                        self.encoder_model.run(
-                            ["cat_conditions", "latent_features", "t_span", "data_lengths", "prompt_features",
-                             "prompt_length"], {
-                                "wave_24k": wave_24k,
-                                "semantic_wave": self.compute_semantic(wave_24k),
-                                "prosody_wave": timbre_wave,
-                                "semantic_timbre": self.compute_semantic(timbre_wave)
-                            }))
-
-                    generated_chunks: List[np.ndarray] = []
-                    prev_overlap_chunk: Optional[np.ndarray] = None
-
-                    # Обработка каждого сегмента аудио
-                    for seg_idx, seg_length in enumerate(data_lengths):
-                        segment_wave = self._synthesize_segment(cat_conditions[seg_idx],
-                                                                latent_features[seg_idx],
-                                                                time_span,
-                                                                int(seg_length),
-                                                                prompt_features[seg_idx],
-                                                                speaker_style,
-                                                                prompt_length)
-                        # Если это первый сегмент, сохраняем начальную часть и устанавливаем перекрытие
-                        if seg_idx == 0:
-                            mute_fade(segment_wave, self.OUTPUT_SR)
-                            chunk = segment_wave[:-OVERLAP_LENGTH]
-                            generated_chunks.append(chunk)
-                            prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-                        # Если это последний сегмент, осуществляем окончательное склеивание
-                        elif seg_idx == len(data_lengths) - 1:
-                            chunk = _crossfade(prev_overlap_chunk, segment_wave, OVERLAP_LENGTH)
-                            generated_chunks.append(chunk)
-                            break
-                        # Для всех промежуточных сегментов
-                        else:
-                            chunk = _crossfade(prev_overlap_chunk, segment_wave[:-OVERLAP_LENGTH], OVERLAP_LENGTH)
-                            generated_chunks.append(chunk)
-                            prev_overlap_chunk = segment_wave[-OVERLAP_LENGTH:]
-
-                    # Объединяем все сегменты в одно аудио
-                    wave_24k = np.concatenate(generated_chunks)
-                elif self.vc_func:
-                    wave_24k = self.vc_func(wave_24k, current_input.timbre_wave_24k, current_input.prosody_wave_24k)
-
-                if self.postprocess_func:
-                    wave_24k = self.postprocess_func(wave_24k, current_input)
-
-                synthesized_audios.append(wave_24k)
-
-                self._maybe_reinit_sessions()
-            except Exception as e:
-                traceback.print_exc()
-                synthesized_audios.append(None)
-                self._maybe_reinit_sessions()
-                continue
-
-        return synthesized_audios
+        finally:
+            self._init_sessions()
 
     def synthesize(self, inputs, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40,
                    stress_exclusions: Dict[str, Any] = {}):
@@ -889,13 +732,8 @@ class SVR_TTS:
                 ))
             mapping.append((idx, len(chunks)))
 
-        try:
-            all_waves = self.synthesize_batch(split_inputs, stress_exclusions, tqdm_kwargs=tqdm_kwargs)
-        except Exception as e:
-            traceback.print_exc()
-            all_waves = [None] * len(split_inputs)
+        batch_generator = self.synthesize_batch(split_inputs, stress_exclusions, tqdm_kwargs=tqdm_kwargs)
 
-        merged = []
         wave_idx = 0
         OVERLAP_LEN = self.FADE_LEN
 
@@ -905,7 +743,13 @@ class SVR_TTS:
             ok = True
 
             for seg_idx in range(count):
-                wave = all_waves[wave_idx + seg_idx]
+                try:
+                    wave = next(batch_generator)
+                except StopIteration:
+                    wave = None
+                except Exception as e:
+                    traceback.print_exc()
+                    wave = None
 
                 if not ok:
                     continue
@@ -928,27 +772,19 @@ class SVR_TTS:
                     generated_chunks.append(chunk)
                     prev_overlap_chunk = wave[-OVERLAP_LEN:]
 
-            wave_idx += count
             if ok and generated_chunks:
                 result_24k = np.concatenate(generated_chunks)
-                merged.append(result_24k)
+                yield result_24k
             else:
-                merged.append(None)
-
-        return merged
+                yield None
 
     def vocos_decode(self, sess: ort.InferenceSession, mel: np.ndarray,
                      n_fft: int = 1024, hop: int = 256) -> np.ndarray:
-        """
-        mel: float32 [B, 80, T]
-        return: float32 [T_wav]
-        """
         assert mel.ndim == 3 and mel.shape[1] == 80, f"mel shape {mel.shape}"
 
         mag, xr, yi = sess.run(None, {'mels': mel})
         spec = (mag.astype(np.float32)) * (xr.astype(np.float32) + 1j * yi.astype(np.float32))
 
         result = istft_ola(spec.astype(np.complex64), n_fft=n_fft, hop=hop)
-
         result = resampy.resample(result, INPUT_SR, self.OUTPUT_SR)
         return result
