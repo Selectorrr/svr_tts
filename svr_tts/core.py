@@ -79,15 +79,19 @@ def _prefetch_generator(generator, buffer_size=1):
                     except queue.Full:
                         continue
         except Exception as e:
-            try:
-                q.put(e, timeout=0.5)
-            except queue.Full:
-                pass
+            while not stop_event.is_set():
+                try:
+                    q.put(e, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
         finally:
-            try:
-                q.put(sentinel, timeout=0.5)
-            except queue.Full:
-                pass
+            while not stop_event.is_set():
+                try:
+                    q.put(sentinel, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
@@ -102,11 +106,18 @@ def _prefetch_generator(generator, buffer_size=1):
             yield item
     finally:
         stop_event.set()
+        # Сначала опустошаем очередь, чтобы освободить ссылки на объекты в памяти
         while not q.empty():
             try:
                 q.get_nowait()
             except queue.Empty:
                 break
+        # Теперь кладем sentinel, чтобы гарантированно разблокировать любой поток,
+        # зависший на q.get() (например, при досрочном закрытии генератора)
+        try:
+            q.put_nowait(sentinel)
+        except queue.Full:
+            pass
 
 
 class SVR_TTS:
@@ -119,6 +130,7 @@ class SVR_TTS:
                  session_options: SessionOptions | None = None,
                  timbre_cache_dir: str = 'workspace/voices/',
                  user_models_dir: str | None = None,
+                 reinit_every: int = 32,
                  dur_norm_low: float = 5.0,
                  dur_high_t0=1.0,
                  dur_high_t1=30.0,
@@ -157,6 +169,8 @@ class SVR_TTS:
         self._providers = providers
         self._provider_options = provider_options
         self._session_options = session_options
+        self._reinit_every = int(reinit_every)
+        self._processed_since_reinit = 0
         self.dur_norm_low = dur_norm_low
         self.dur_high_t0 = dur_high_t0
         self.dur_high_t1 = dur_high_t1
@@ -265,6 +279,27 @@ class SVR_TTS:
                     provider_options=self._provider_options,
                     sess_options=self._session_options,
                 )
+
+    def _maybe_reinit_sessions(self) -> None:
+        if self._reinit_every <= 0:
+            return
+
+        if self._processed_since_reinit >= self._reinit_every:
+            # Сначала удаляем старые сессии, чтобы разорвать ссылки
+            for attr in ['base_model', 'cfe_model', 'semantic_model', 'encoder_model', 'style_model', 'estimator_model', 'vocoder_model']:
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+
+            self._init_sessions()
+            self._processed_since_reinit = 0
 
     def _get_cache_dir(self) -> str:
         cache_dir = user_cache_dir("svr_tts", "SynthVoiceRu")
@@ -644,6 +679,13 @@ class SVR_TTS:
                     scaling_max,
                 )
 
+            # Обновляем прогресс для ватчдога, если он доступен в глобальном пространстве PipelineModule
+            try:
+                import modules.PipelineModule
+                modules.PipelineModule.update_progress()
+            except Exception:
+                pass
+
             yield (wave_24k, current_input, timbre_wave, prosody_wave, prosody_wave_24k)
 
     def _generate_voice_conversion(self, buffered_base_generator):
@@ -707,6 +749,12 @@ class SVR_TTS:
                 if self.postprocess_func:
                     wave_24k = self.postprocess_func(wave_24k, current_input, wave_24k_orig)
 
+                try:
+                    import modules.PipelineModule
+                    modules.PipelineModule.update_progress()
+                except Exception:
+                    pass
+
                 yield wave_24k
 
             except Exception as e:
@@ -743,8 +791,17 @@ class SVR_TTS:
         try:
             for result in buffered_vc_generator:
                 yield result
+                self._processed_since_reinit += 1
         finally:
-            self._init_sessions()
+            try:
+                buffered_vc_generator.close()
+            except Exception:
+                pass
+            try:
+                buffered_base_generator.close()
+            except Exception:
+                pass
+            self._maybe_reinit_sessions()
 
     def synthesize(self, inputs, tqdm_kwargs: Dict[str, Any] = None, rtrim_top_db=40,
                    stress_exclusions: Dict[str, Any] = {}):
@@ -769,46 +826,52 @@ class SVR_TTS:
         wave_idx = 0
         OVERLAP_LEN = self.FADE_LEN
 
-        for idx, count in mapping:
-            generated_chunks = []
-            prev_overlap_chunk = None
-            ok = True
+        try:
+            for idx, count in mapping:
+                generated_chunks = []
+                prev_overlap_chunk = None
+                ok = True
 
-            for seg_idx in range(count):
-                try:
-                    wave = next(batch_generator)
-                except StopIteration:
-                    wave = None
-                except Exception as e:
-                    traceback.print_exc()
-                    wave = None
+                for seg_idx in range(count):
+                    try:
+                        wave = next(batch_generator)
+                    except StopIteration:
+                        wave = None
+                    except Exception as e:
+                        traceback.print_exc()
+                        wave = None
 
-                if not ok:
-                    continue
+                    if not ok:
+                        continue
 
-                if wave is None:
-                    ok = False
-                    continue
+                    if wave is None:
+                        ok = False
+                        continue
 
-                if seg_idx == 0:
-                    if count > 1:
-                        generated_chunks.append(wave[:-OVERLAP_LEN])
+                    if seg_idx == 0:
+                        if count > 1:
+                            generated_chunks.append(wave[:-OVERLAP_LEN])
+                        else:
+                            generated_chunks.append(wave)
+                        prev_overlap_chunk = wave[-OVERLAP_LEN:]
+                    elif seg_idx == count - 1:
+                        chunk = _crossfade(prev_overlap_chunk, wave, OVERLAP_LEN)
+                        generated_chunks.append(chunk)
                     else:
-                        generated_chunks.append(wave)
-                    prev_overlap_chunk = wave[-OVERLAP_LEN:]
-                elif seg_idx == count - 1:
-                    chunk = _crossfade(prev_overlap_chunk, wave, OVERLAP_LEN)
-                    generated_chunks.append(chunk)
-                else:
-                    chunk = _crossfade(prev_overlap_chunk, wave[:-OVERLAP_LEN], OVERLAP_LEN)
-                    generated_chunks.append(chunk)
-                    prev_overlap_chunk = wave[-OVERLAP_LEN:]
+                        chunk = _crossfade(prev_overlap_chunk, wave[:-OVERLAP_LEN], OVERLAP_LEN)
+                        generated_chunks.append(chunk)
+                        prev_overlap_chunk = wave[-OVERLAP_LEN:]
 
-            if ok and generated_chunks:
-                result_24k = np.concatenate(generated_chunks)
-                yield result_24k
-            else:
-                yield None
+                if ok and generated_chunks:
+                    result_24k = np.concatenate(generated_chunks)
+                    yield result_24k
+                else:
+                    yield None
+        finally:
+            try:
+                batch_generator.close()
+            except Exception:
+                pass
 
     def vocos_decode(self, sess: ort.InferenceSession, mel: np.ndarray,
                      n_fft: int = 1024, hop: int = 256) -> np.ndarray:
